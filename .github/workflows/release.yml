@@ -8,35 +8,58 @@ on:
 permissions:
   contents: write
 
+env:
+  VERSION: ${{ github.ref_name }}
+
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build Debian package
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
           set -e
           version="${VERSION#v}"
+
           mkdir -p build/pkg/DEBIAN \
             build/pkg/usr/bin \
             build/pkg/usr/share/bash-completion/completions \
             build/pkg/etc/campus-network
-          sed "s/^Version: .*/Version: ${version}/" debian/control > build/pkg/DEBIAN/control
-          sed "s|^VERSION=\"dev\"$|VERSION=\"${VERSION}\"|" src/campus-network > build/pkg/usr/bin/campus-network
-          cp completion/campus-network build/pkg/usr/share/bash-completion/completions/campus-network
-          cp config/config build/pkg/etc/campus-network/config
-          cp debian/conffiles build/pkg/DEBIAN/conffiles
-          cp debian/postinst build/pkg/DEBIAN/postinst
-          chmod 755 build/pkg/usr/bin/campus-network build/pkg/DEBIAN/postinst
-          find build/pkg -type d -exec chmod g-s {} +
-          chmod 0755 build/pkg/DEBIAN
-          dpkg-deb --root-owner-group --build build/pkg "campus-network_${version}_all.deb"
+
+          sed "s/^Version: .*/Version: ${version}/" \
+            debian/control > build/pkg/DEBIAN/control
+
+          sed "s/^VERSION=\"dev\"$/VERSION=\"${VERSION}\"/" \
+            src/campus-network > build/pkg/usr/bin/campus-network
+
+          cp completion/campus-network \
+            build/pkg/usr/share/bash-completion/completions/campus-network
+
+          cp config/config \
+            build/pkg/etc/campus-network/config
+
+          cp debian/conffiles \
+            build/pkg/DEBIAN/conffiles
+
+          cp debian/postinst \
+            build/pkg/DEBIAN/postinst
+
+          chmod 755 \
+            build/pkg/usr/bin/campus-network \
+            build/pkg/DEBIAN/postinst
+
+          dpkg-deb --root-owner-group \
+            --build build/pkg \
+            "campus-network_${version}_all.deb"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${VERSION}" campus-network_*.deb --generate-notes --title "${VERSION}"
+        run: |
+          gh release create "${VERSION}" \
+            campus-network_*.deb \
+            --generate-notes \
+            --title "${VERSION}"
