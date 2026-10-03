@@ -1,0 +1,12 @@
+# campus-network 公共配置
+# 修改配置格式时递增 CONFIG_VERSION；程序会清除旧账号配置并要求重新登录。
+CONFIG_VERSION=1
+
+PORTAL="http://10.28.200.56:8080"
+TEST_URL="http://1.1.1.1"
+FALLBACK_URL="http://www.baidu.com"
+
+SERVICE_1="移动"
+SERVICE_2="电信"
+SERVICE_3="联通"
+SERVICE_4="校园网"

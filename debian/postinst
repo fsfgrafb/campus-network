@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+mkdir -p /var/lib/campus-network
+chmod 0777 /var/lib/campus-network
+if [ ! -e /etc/campus-network/account ]; then
+    touch /etc/campus-network/account
+fi
+chmod 0666 /etc/campus-network/account
+exit 0

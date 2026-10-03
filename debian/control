@@ -1,0 +1,9 @@
+Package: campus-network
+Version: 0.0.0
+Section: net
+Priority: optional
+Architecture: all
+Depends: bash, curl, grep, sed, coreutils
+Maintainer: campus-network contributors
+Description: Ruijie ePortal campus network authentication client
+ A command-line client for authenticating to a Ruijie ePortal campus network.

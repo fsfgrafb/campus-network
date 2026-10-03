@@ -1,0 +1,241 @@
+#!/bin/bash
+set -euo pipefail
+
+PROGRAM_NAME="campus-network"
+VERSION="dev"
+SYSTEM_CONFIG="/etc/campus-network/config"
+ACCOUNT_CONFIG="/etc/campus-network/account"
+USERINDEX="/var/lib/campus-network/userindex"
+
+load_system_config() {
+    if [ ! -r "$SYSTEM_CONFIG" ]; then
+        echo "错误：系统配置不存在或不可读：$SYSTEM_CONFIG" >&2
+        return 1
+    fi
+    unset CONFIG_VERSION PORTAL TEST_URL FALLBACK_URL SERVICE_1 SERVICE_2 SERVICE_3 SERVICE_4
+    # shellcheck disable=SC1090
+    . "$SYSTEM_CONFIG"
+    : "${CONFIG_VERSION:?错误：配置缺少 CONFIG_VERSION}"
+    : "${PORTAL:?错误：配置缺少 PORTAL}"
+    : "${TEST_URL:?错误：配置缺少 TEST_URL}"
+    : "${FALLBACK_URL:?错误：配置缺少 FALLBACK_URL}"
+}
+
+show_help() {
+    echo "用法："
+    echo "  $PROGRAM_NAME login [账号] [密码] [运营商编号]"
+    echo "  $PROGRAM_NAME logout"
+    echo "  $PROGRAM_NAME relogin"
+    echo "  $PROGRAM_NAME status"
+    echo "  $PROGRAM_NAME help"
+    echo "  $PROGRAM_NAME version"
+    echo
+    echo "login："
+    echo "  无参数：使用上次配置；首次登录时交互输入。"
+    echo "  参数不全：使用已有参数，交互输入缺少的参数。"
+    echo "  参数齐全：直接登录。"
+    echo
+    echo "运营商："
+    for i in 1 2 3 4; do
+        eval "service=\${SERVICE_$i-}"
+        [ -n "$service" ] && printf '  %s) %s\n' "$i" "$service"
+    done
+}
+
+reset_account_if_needed() {
+    local old_version=""
+    if [ -f "$ACCOUNT_CONFIG" ]; then
+        old_version=$(sed -n 's/^ACCOUNT_CONFIG_VERSION=\([0-9][0-9]*\)$/\1/p' "$ACCOUNT_CONFIG" | head -n1)
+    fi
+    if [ "$old_version" != "$CONFIG_VERSION" ]; then
+        mkdir -p "$(dirname "$ACCOUNT_CONFIG")"
+        cat > "$ACCOUNT_CONFIG" <<EOF
+# 由 $PROGRAM_NAME 自动管理，请勿手动编辑。
+ACCOUNT_CONFIG_VERSION=$CONFIG_VERSION
+EOF
+        chmod 666 "$ACCOUNT_CONFIG"
+        echo "配置版本已变化，旧账号配置已清除。"
+    fi
+}
+
+load_account() {
+    reset_account_if_needed
+    unset ACCOUNT_CONFIG_VERSION USER PASS SERVICE
+    # shellcheck disable=SC1090
+    . "$ACCOUNT_CONFIG"
+    [ "${ACCOUNT_CONFIG_VERSION:-}" = "$CONFIG_VERSION" ] || return 1
+    [ -n "${USER:-}" ] && [ -n "${PASS:-}" ] && [ -n "${SERVICE:-}" ]
+}
+
+save_account() {
+    local user="$1" pass="$2" service="$3"
+    umask 022
+    cat > "$ACCOUNT_CONFIG" <<EOF
+# 由 $PROGRAM_NAME 自动管理，请勿手动编辑。
+ACCOUNT_CONFIG_VERSION=$CONFIG_VERSION
+USER=$(printf '%q' "$user")
+PASS=$(printf '%q' "$pass")
+SERVICE=$(printf '%q' "$service")
+EOF
+    chmod 666 "$ACCOUNT_CONFIG"
+}
+
+choose_service() {
+    local choice service
+    echo "请选择运营商："
+    for i in 1 2 3 4; do
+        eval "service=\${SERVICE_$i-}"
+        [ -n "$service" ] && printf '%s) %s\n' "$i" "$service"
+    done
+    while true; do
+        read -r -p "> " choice
+        case "$choice" in
+            1|2|3|4)
+                eval "service=\${SERVICE_$choice-}"
+                if [ -n "$service" ]; then
+                    CHOSEN_SERVICE="$service"
+                    return 0
+                fi
+                ;;
+        esac
+        echo "无效的运营商编号，请重新输入。"
+    done
+}
+
+perform_login() {
+    local user="$1" pass="$2" service="$3"
+    local response curl_exit=0 qs result errmsg user_index
+
+    response=$(curl -s --max-time 10 "$TEST_URL") || curl_exit=$?
+    if printf '%s' "$response" | grep -q 'index\.jsp?'; then
+        qs=$(printf '%s' "$response" | grep -oP 'index\.jsp\?\K[^'"'"']+' | head -n1)
+        result=$(curl -s -X POST \
+            "${PORTAL}/eportal/InterFace.do?method=login" \
+            -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+            -H 'User-Agent: Mozilla/5.0 (X11; Linux aarch64)' \
+            -H "Referer: ${PORTAL}/eportal/index.jsp?${qs}" \
+            -H "Origin: ${PORTAL}" \
+            --data-urlencode "userId=${user}" \
+            --data-urlencode "password=${pass}" \
+            --data-urlencode "service=${service}" \
+            --data-urlencode "queryString=${qs}" \
+            -d 'operatorPwd=' \
+            -d 'operatorUserId=' \
+            -d 'validcode=' \
+            -d 'passwordEncrypt=false')
+
+        if printf '%s' "$result" | grep -q '"result":"success"'; then
+            user_index=$(printf '%s' "$result" | grep -oP '"userIndex":"\K[^" ]+' | head -n1)
+            mkdir -p "$(dirname "$USERINDEX")"
+            printf '%s\n' "$user_index" > "$USERINDEX"
+            chmod 666 "$USERINDEX"
+            echo "认证成功。"
+        else
+            errmsg=$(printf '%s' "$result" | grep -oP '"message":"\K[^"}]+' | head -n1 || true)
+            echo "认证失败：${errmsg:-未知错误}" >&2
+            return 1
+        fi
+    elif [ "$curl_exit" -eq 0 ] && [ -n "$response" ]; then
+        echo "已在线。"
+    elif curl -s --max-time 5 "$FALLBACK_URL" | grep -q '百度'; then
+        echo "已在线。"
+    else
+        echo "网络异常（无法连接外网）。" >&2
+        return 1
+    fi
+}
+
+login() {
+    local user="${1-}" pass="${2-}" service="${3-}"
+
+    if [ "$#" -eq 0 ] && load_account; then
+        echo "使用上次配置：$USER @ $SERVICE"
+        perform_login "$USER" "$PASS" "$SERVICE"
+        return
+    fi
+
+    if [ -z "$user" ]; then read -r -p "账号: " user; fi
+    if [ -z "$pass" ]; then read -r -s -p "密码: " pass; echo; fi
+    if [ -z "$service" ]; then
+        choose_service
+        service="$CHOSEN_SERVICE"
+    fi
+
+    case "$service" in
+        1|2|3|4)
+            local selected
+            eval "selected=\${SERVICE_$service-}"
+            [ -n "$selected" ] || { echo "错误：无效的运营商编号。" >&2; return 2; }
+            service="$selected"
+            ;;
+    esac
+
+    save_account "$user" "$pass" "$service"
+    echo "正在认证：$user @ $service ..."
+    perform_login "$user" "$pass" "$service"
+}
+
+logout() {
+    local user_index response
+    if [ ! -s "$USERINDEX" ]; then
+        echo "无登录记录。"
+        return 0
+    fi
+    user_index=$(tr -d '\r\n' < "$USERINDEX")
+    response=$(curl -s -X POST \
+        "${PORTAL}/eportal/InterFace.do?method=logout" \
+        --data-urlencode "userIndex=$user_index")
+    if printf '%s' "$response" | grep -q '"result":"success"'; then
+        rm -f "$USERINDEX"
+        echo "下线成功。"
+    elif printf '%s' "$response" | grep -q '"message":"用户已不在线"'; then
+        rm -f "$USERINDEX"
+        echo "用户已离线。"
+    else
+        echo "下线失败。" >&2
+        return 1
+    fi
+}
+
+relogin() {
+    load_account || {
+        echo "没有完整的账号配置，请先执行：$PROGRAM_NAME login" >&2
+        return 1
+    }
+    logout || true
+    sleep 3
+    perform_login "$USER" "$PASS" "$SERVICE"
+}
+
+status() {
+    local response curl_exit=0
+    response=$(curl -s --max-time 10 "$TEST_URL") || curl_exit=$?
+    if [ "$curl_exit" -eq 0 ] && [ -n "$response" ]; then
+        echo "网络正常。"
+    elif curl -s --max-time 5 "$FALLBACK_URL" | grep -q '百度'; then
+        echo "网络正常。"
+    else
+        echo "网络异常。"
+        return 1
+    fi
+}
+
+main() {
+    load_system_config
+    reset_account_if_needed
+    case "${1:-help}" in
+        login)
+            shift
+            [ "$#" -le 3 ] || { show_help >&2; return 2; }
+            login "$@"
+            ;;
+        logout) [ "$#" -eq 1 ] || { show_help >&2; return 2; }; logout ;;
+        relogin) [ "$#" -eq 1 ] || { show_help >&2; return 2; }; relogin ;;
+        status) [ "$#" -eq 1 ] || { show_help >&2; return 2; }; status ;;
+        help|-h|--help) show_help ;;
+        version|-v|--version) echo "$VERSION" ;;
+        *) show_help >&2; return 2 ;;
+    esac
+}
+
+main "$@"
