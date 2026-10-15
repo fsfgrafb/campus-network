@@ -1,65 +1,231 @@
-name: Release
+name: Test, package and release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
-env:
-  VERSION: ${{ github.ref_name }}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, python: '3.9'}
+          - {runner: ubuntu-24.04, python: '3.11'}
+          - {runner: ubuntu-24.04, python: '3.13'}
+          - {runner: ubuntu-24.04-arm, python: '3.11'}
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build Debian package
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+      - name: Check version, JSON and shell scripts
         run: |
-          set -e
-          version="${VERSION#v}"
+          test "$(python src/campus-network --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" = "$(cat VERSION)"
+          python -m json.tool config/config.json >/dev/null
+          for script in install.sh tools/offline-bundle.sh debian/postinst debian/prerm debian/postrm; do sh -n "$script"; done
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then test "$GITHUB_REF_NAME" = "v$(cat VERSION)"; fi
 
-          mkdir -p build/pkg/DEBIAN \
-            build/pkg/usr/bin \
-            build/pkg/usr/share/bash-completion/completions \
-            build/pkg/etc/campus-network
+  package:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
+      - run: python3 tools/build.py
+      - name: Inspect packages
+        run: |
+          dpkg-deb --info dist/*.deb
+          rpm -qip dist/*.rpm
+          tar -tzf dist/*_linux-any.tar.gz
+          cd dist && sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: packages
+          path: dist/*
+          if-no-files-found: error
 
-          sed "s/^Version: .*/Version: ${version}/" \
-            debian/control > build/pkg/DEBIAN/control
+  install:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: packages
+          path: dist
+      - name: Install and recover service on native systemd
+        run: |
+          sudo dpkg -i dist/*.deb
+          for attempt in $(seq 1 30); do campus-network status --json >/dev/null 2>&1 && break; sleep 1; done
+          systemctl is-active --quiet campus-network.service
+          test "$(stat -c %a /run/campus-network/control.sock)" = 666
+          campus-network status
+          campus-network off
+          sudo systemctl stop campus-network.service
+          sudo python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = Path('/etc/campus-network/config.json')
+          value = json.loads(config.read_text())
+          value['interface'] = 'cn-ci-missing'
+          config.write_text(json.dumps(value))
+          account = Path('/etc/campus-network/account.json')
+          account.write_text(json.dumps({'username': 'ci', 'password': 'test', 'service': '校园网'}))
+          account.chmod(0o600)
+          PY
+          sudo systemctl start campus-network.service
+          for attempt in $(seq 1 30); do campus-network status --json >/dev/null 2>&1 && break; sleep 1; done
+          sudo -u nobody campus-network on --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["mode"] == "on"'
+          sudo systemctl restart campus-network.service
+          for attempt in $(seq 1 30); do campus-network status --json >/dev/null 2>&1 && break; sleep 1; done
+          sudo -u nobody campus-network status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["mode"] == "on"'
+          sudo -u nobody campus-network off --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["mode"] == "off"'
+          previous_pid=$(systemctl show campus-network.service --property MainPID --value)
+          sudo systemctl kill --signal=KILL campus-network.service
+          for attempt in $(seq 1 30); do
+            current_pid=$(systemctl show campus-network.service --property MainPID --value)
+            if test "$current_pid" != 0 && test "$current_pid" != "$previous_pid" && campus-network status --json >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          test "$current_pid" != "$previous_pid"
+          systemctl is-active --quiet campus-network.service
+          campus-network status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["mode"] == "off"'
+          previous_pid=$current_pid
+          sudo systemctl kill --kill-whom=main --signal=STOP campus-network.service
+          for attempt in $(seq 1 50); do
+            current_pid=$(systemctl show campus-network.service --property MainPID --value)
+            if test "$current_pid" != 0 && test "$current_pid" != "$previous_pid" && campus-network status --json >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          test "$current_pid" != "$previous_pid"
+          systemctl is-active --quiet campus-network.service
+          campus-network status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["mode"] == "off"'
+          sudo dpkg -r campus-network
+          tar -xzf dist/*_linux-any.tar.gz
+          sudo sh campus-network-*/install.sh
+          for attempt in $(seq 1 30); do campus-network status --json >/dev/null 2>&1 && break; sleep 1; done
+          campus-network status
+          campus-network off
 
-          sed "s/^VERSION=\"dev\"$/VERSION=\"${VERSION}\"/" \
-            src/campus-network > build/pkg/usr/bin/campus-network
+  debian:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['12', '13']
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: packages
+          path: dist
+      - name: Check Debian package install and upgrade
+        run: |
+          docker run --rm -v "$PWD/dist:/artifacts:ro" debian:${{ matrix.version }}-slim sh -ec '
+            apt-get update
+            apt-get install -y --no-install-recommends python3 curl systemd
+            dpkg -i /artifacts/*.deb
+            campus-network --version
+            systemctl is-enabled campus-network.service
+            printf "{\"custom\":true}\n" > /etc/campus-network/config.json
+            dpkg -i /artifacts/*.deb
+            grep custom /etc/campus-network/config.json
+          '
 
-          cp completion/campus-network \
-            build/pkg/usr/share/bash-completion/completions/campus-network
+  rpm:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: packages
+          path: dist
+      - name: Check RPM install
+        run: |
+          docker run --rm -v "$PWD/dist:/artifacts:ro" fedora:43 sh -ec '
+            dnf install -y python3 curl-minimal systemd
+            rpm -ivh /artifacts/*.rpm
+            campus-network --version
+            systemctl is-enabled campus-network.service
+          '
 
-          cp config/config \
-            build/pkg/etc/campus-network/config
+  offline:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, arch: amd64, version: '12'}
+          - {runner: ubuntu-24.04, arch: amd64, version: '13'}
+          - {runner: ubuntu-24.04-arm, arch: arm64, version: '12'}
+          - {runner: ubuntu-24.04-arm, arch: arm64, version: '13'}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: packages
+          path: dist
+      - name: Download complete Debian dependency closure
+        run: docker run --rm -e DEBIAN_FRONTEND=noninteractive -v "$PWD:/work" -w /work debian:${{ matrix.version }}-slim sh tools/offline-bundle.sh
+      - name: Install without network, Python or curl preinstalled
+        run: |
+          docker run --rm --network none -e DEBIAN_FRONTEND=noninteractive -v "$PWD/dist:/artifacts:ro" debian:${{ matrix.version }}-slim sh -ec '
+            mkdir /tmp/offline
+            tar -xzf /artifacts/*_debian${{ matrix.version }}_${{ matrix.arch }}_offline.tar.gz -C /tmp/offline
+            sh /tmp/offline/campus-network_*/install.sh
+            campus-network --version
+            systemctl is-enabled campus-network.service
+          '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: offline-debian${{ matrix.version }}-${{ matrix.arch }}
+          path: dist/*_offline.tar.gz
+          if-no-files-found: error
 
-          cp debian/conffiles \
-            build/pkg/DEBIAN/conffiles
-
-          cp debian/postinst \
-            build/pkg/DEBIAN/postinst
-
-          chmod 755 \
-            build/pkg/usr/bin/campus-network \
-            build/pkg/DEBIAN/postinst
-
-          dpkg-deb --root-owner-group \
-            --build build/pkg \
-            "campus-network_${version}_all.deb"
-
-      - name: Create GitHub Release
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test, package, install, debian, rpm, offline]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish verified packages
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "${VERSION}" \
-            campus-network_*.deb \
-            --generate-notes \
-            --title "${VERSION}"
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum ./*.deb ./*.rpm ./*.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" ./* --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

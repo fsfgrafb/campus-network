@@ -1,0 +1,15 @@
+{
+  "portal": "http://10.28.200.56:8080",
+  "test_url": "http://1.1.1.1",
+  "interface": "",
+  "probe_urls": [
+    {"url": "https://www.baidu.com", "status": 200, "contains": "百度"},
+    {"url": "https://www.qq.com", "status": 200, "contains": "腾讯"}
+  ],
+  "check_interval": 3,
+  "connect_timeout": 2,
+  "request_timeout": 5,
+  "retry_base": 2,
+  "retry_max": 120,
+  "initial_jitter": 3
+}

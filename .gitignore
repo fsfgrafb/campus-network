@@ -2,3 +2,6 @@
 *.buildinfo
 *.changes
 build/
+dist/
+*.rpm
+__pycache__/

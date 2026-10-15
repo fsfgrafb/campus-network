@@ -1,568 +1,565 @@
-#!/bin/bash
-# ============================================================================
-# campus-network - 锐捷 ePortal 校园网认证工具
-# ============================================================================
+#!/usr/bin/env python3
+"""Persistent ePortal manager; public commands: on, off, status."""
 
-set -euo pipefail
+import argparse
+import ast
+import getpass
+import html
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import random
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from urllib.parse import quote, urlencode, urlsplit
 
-VERSION="__VERSION__"
-
-SYSTEM_CONFIG="/etc/campus-network/config"
-ACCOUNT_CONFIG="/etc/campus-network/account"
-USER_INDEX="/var/lib/campus-network/userindex"
-
-# ============================================================================
-# 颜色
-# ============================================================================
-
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-    RESET='\033[0m'
-    BOLD='\033[1m'
-    DIM='\033[2m'
-    BLUE='\033[34m'
-    GREEN='\033[32m'
-    YELLOW='\033[33m'
-    RED='\033[31m'
-    CYAN='\033[36m'
-else
-    RESET=''
-    BOLD=''
-    DIM=''
-    BLUE=''
-    GREEN=''
-    YELLOW=''
-    RED=''
-    CYAN=''
-fi
-
-info() {
-    printf "${BLUE}→${RESET} %s\n" "$*"
+VERSION = "2.0.0"
+CONFIG_DIR = Path("/etc/campus-network")
+STATE_DIR = Path("/var/lib/campus-network")
+RUNTIME_DIR = Path("/run/campus-network")
+SERVICES = ("移动", "电信", "联通", "校园网")
+DEFAULT_CONFIG = {
+    "portal": "http://10.28.200.56:8080", "test_url": "http://1.1.1.1", "interface": "",
+    "probe_urls": [
+        {"url": "https://www.baidu.com", "status": 200, "contains": "百度"},
+        {"url": "https://www.qq.com", "status": 200, "contains": "腾讯"},
+    ],
+    "check_interval": 3, "connect_timeout": 2, "request_timeout": 5,
+    "retry_base": 2, "retry_max": 120, "initial_jitter": 3,
 }
 
-success() {
-    printf "${GREEN}✓${RESET} %s\n" "$*"
-}
 
-warn() {
-    printf "${YELLOW}!${RESET} %s\n" "$*" >&2
-}
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
 
-error() {
-    printf "${RED}✗${RESET} %s\n" "$*" >&2
-}
 
-title() {
-    printf "\n${BOLD}${CYAN}%s${RESET}\n" "$*"
-}
+def atomic_json(path, value):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name, dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if sys.platform == "linux":
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
-separator() {
-    printf "${DIM}────────────────────────────────────────${RESET}\n"
-}
 
-# ============================================================================
-# 帮助
-# ============================================================================
+def load_config(path):
+    config = dict(DEFAULT_CONFIG, **read_json(path, {}))
+    for key in ("check_interval", "connect_timeout", "request_timeout", "retry_base", "retry_max", "initial_jitter"):
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < (0 if key == "initial_jitter" else .01):
+            raise ValueError("配置 %s 必须是有效的时间间隔" % key)
+    if config["initial_jitter"] > 30 or config["request_timeout"] > 8 or config["connect_timeout"] > config["request_timeout"]:
+        raise ValueError("initial_jitter 不得超过 30 秒，请求超时不得超过 8 秒，连接超时不得超过总超时")
+    if config["retry_max"] < config["retry_base"]:
+        raise ValueError("retry_max 不得小于 retry_base")
+    if not isinstance(config["interface"], str) or len(config["interface"]) > 15:
+        raise ValueError("interface 必须是 Linux 网卡名或空字符串")
+    for key in ("portal", "test_url"):
+        parsed = urlsplit(config[key])
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username:
+            raise ValueError("无效的 URL：" + key)
+    if not config["probe_urls"] or len(config["probe_urls"]) > 2:
+        raise ValueError("配置一到两个 HTTPS 外网探测地址")
+    for probe in config["probe_urls"]:
+        if urlsplit(probe["url"]).scheme != "https" or not isinstance(probe["status"], int):
+            raise ValueError("外网探测必须使用 HTTPS 和明确的 status")
+        if probe["status"] != 204 and not probe.get("contains"):
+            raise ValueError("非 204 探测必须配置 contains")
+    return config
 
-show_help() {
-    cat <<EOF
 
-${BOLD}campus-network${RESET} ${DIM}${VERSION}${RESET}
-锐捷 ePortal 校园网认证工具
+def valid_account(value):
+    if not isinstance(value, dict):
+        raise ValueError("账号配置必须是对象")
+    if any(not isinstance(value.get(k), str) or not 0 < len(value[k]) <= 512 for k in ("username", "password")):
+        raise ValueError("账号和密码不能为空，且不得超过 512 个字符")
+    if re.search(r"[\x00-\x1f\x7f-\x9f]", value["username"]):
+        raise ValueError("账号不得包含控制字符")
+    if value.get("service") not in SERVICES:
+        raise ValueError("运营商必须是移动、电信、联通或校园网")
+    return {key: value[key] for key in ("username", "password", "service")}
 
-${BOLD}用法${RESET}
-  campus-network login [账号] [密码] [运营商]
-  campus-network logout
-  campus-network relogin
-  campus-network status
-  campus-network config
-  campus-network version
-  campus-network help
 
-${BOLD}登录${RESET}
-  不提供参数时，使用上次保存的账号和运营商。
-  如果没有保存的账号，将交互式要求输入。
+def shell_values(path, keys):
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in keys:
+            if value.startswith("$'"):
+                values[key] = ast.literal_eval(value[1:].replace(r"\e", r"\x1b").replace(r"\E", r"\x1b"))
+            else:
+                parts = shlex.split(value, comments=False)
+                values[key] = parts[0] if len(parts) == 1 else ""
+    return values
 
-  如果只提供部分参数，将交互式补充剩余参数。
 
-${BOLD}运营商${RESET}
-  1) 移动
-  2) 电信
-  3) 联通
-  4) 校园网
+def migrate_legacy(account_path, state_dir):
+    # The old account file was world-writable: parse data, never execute it.
+    if not account_path.exists():
+        old_config = account_path.with_name("config")
+        config_path = account_path.with_name("config.json")
+        if old_config.exists():
+            config = read_json(config_path, {})
+            for key, value in shell_values(old_config, ("PORTAL", "TEST_URL")).items():
+                new_key = {"PORTAL": "portal", "TEST_URL": "test_url"}[key]
+                if config.get(new_key, DEFAULT_CONFIG[new_key]) == DEFAULT_CONFIG[new_key]:
+                    config[new_key] = value
+            atomic_json(config_path, config)
+        old = account_path.with_name("account")
+        if old.exists():
+            try:
+                values = shell_values(old, ("USER", "PASS", "SERVICE"))
+                atomic_json(account_path, valid_account({
+                    "username": values.get("USER"), "password": values.get("PASS"), "service": values.get("SERVICE"),
+                }))
+                old.chmod(0o600)
+                logging.info("已迁移旧账号配置")
+            except (ValueError, SyntaxError):
+                logging.warning("旧账号配置无法自动迁移；首次 on 时重新配置")
+    old_index = state_dir / "userindex"
+    if not (state_dir / "state.json").exists() and old_index.exists():
+        atomic_json(state_dir / "state.json", {
+            "mode": "off", "session": old_index.read_text().strip(), "generation": 0,
+        })
+        old_index.unlink()
 
-${BOLD}示例${RESET}
-  campus-network login
-  campus-network login Z09124129
-  campus-network login Z09124129 20051023
-  campus-network login Z09124129 20051023 1
 
-${BOLD}环境变量${RESET}
-  NO_COLOR=1    禁用彩色输出
+class Portal:
+    def __init__(self, config, runner=None):
+        self.config = dict(DEFAULT_CONFIG, **config)
+        self.runner = runner or subprocess.run
+        self.interface = self.config["interface"]
+        self.cancelled = lambda: False
 
-EOF
-}
+    def request(self, url, fields=None, headers=None, timeout=None):
+        timeout = timeout or self.config["request_timeout"]
+        command = ["curl", "-q", "-sS", "--ipv4", "--noproxy", "*", "--proto", "=http,https",
+                   "--connect-timeout", str(self.config["connect_timeout"]), "--max-time", str(timeout),
+                   "--max-filesize", "1048576", "--write-out", "\n%{http_code}"]
+        if self.interface:
+            command += ["--interface", self.interface]
+        for key, value in (headers or {}).items():
+            command += ["-H", key + ": " + value]
+        data = None
+        if fields is not None:
+            command += ["-X", "POST", "--data-binary", "@-"]
+            data = urlencode(fields, quote_via=quote).encode("utf-8")
+        command += ["--url", url]
+        result = self.runner(command, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 1)
+        if result.returncode:
+            raise OSError("HTTP 请求失败（curl %s）" % result.returncode)
+        body, _, status = result.stdout.decode("utf-8", errors="replace").rpartition("\n")
+        return int(status), body
 
-# ============================================================================
-# 配置
-# ============================================================================
-
-load_system_config() {
-    if [ ! -f "$SYSTEM_CONFIG" ]; then
-        error "系统配置不存在：$SYSTEM_CONFIG"
-        exit 2
-    fi
-
-    # shellcheck disable=SC1090
-    . "$SYSTEM_CONFIG"
-
-    : "${CONFIG_VERSION:?系统配置缺少 CONFIG_VERSION}"
-    : "${PORTAL:?系统配置缺少 PORTAL}"
-    : "${TEST_URL:?系统配置缺少 TEST_URL}"
-    : "${FALLBACK_URL:?系统配置缺少 FALLBACK_URL}"
-}
-
-load_account_config() {
-    if [ ! -f "$ACCOUNT_CONFIG" ]; then
-        return 1
-    fi
-
-    # shellcheck disable=SC1090
-    . "$ACCOUNT_CONFIG"
-
-    : "${ACCOUNT_CONFIG_VERSION:?账号配置缺少 ACCOUNT_CONFIG_VERSION}"
-    : "${USER:?账号配置缺少 USER}"
-    : "${PASS:?账号配置缺少 PASS}"
-    : "${SERVICE:?账号配置缺少 SERVICE}"
-
-    if [ "$ACCOUNT_CONFIG_VERSION" != "$CONFIG_VERSION" ]; then
-        warn "账号配置版本已过期，将清除旧账号信息。"
-        rm -f "$ACCOUNT_CONFIG"
-        return 1
-    fi
-
-    return 0
-}
-
-save_account_config() {
-    local user="$1"
-    local pass="$2"
-    local service="$3"
-
-    mkdir -p "$(dirname "$ACCOUNT_CONFIG")"
-
-    cat > "$ACCOUNT_CONFIG" <<EOF
-# campus-network account configuration
-# This file is shared by all users.
-
-ACCOUNT_CONFIG_VERSION=$CONFIG_VERSION
-USER=$(printf '%q' "$user")
-PASS=$(printf '%q' "$pass")
-SERVICE=$(printf '%q' "$service")
-EOF
-
-    chmod 644 "$ACCOUNT_CONFIG"
-}
-
-# ============================================================================
-# 运营商
-# ============================================================================
-
-choose_service() {
-    local choice
-
-    title "选择运营商"
-
-    printf "  ${BOLD}1${RESET}) 移动\n"
-    printf "  ${BOLD}2${RESET}) 电信\n"
-    printf "  ${BOLD}3${RESET}) 联通\n"
-    printf "  ${BOLD}4${RESET}) 校园网\n\n"
-
-    while true; do
-        read -r -p "请输入选项 [1-4]: " choice
-
-        case "$choice" in
-            1)
-                SERVICE="移动"
+    def probe(self):
+        try:
+            _, body = self.request(self.config["test_url"], timeout=min(3, self.config["request_timeout"]))
+            match = re.search(r"index\.jsp\?([^'\"<>\s]+)", body)
+            if match:
+                return {"kind": "portal", "query": html.unescape(match[1]), "reason": "需要校园网认证"}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        for probe in self.config["probe_urls"]:
+            if self.cancelled():
                 break
-                ;;
-            2)
-                SERVICE="电信"
-                break
-                ;;
-            3)
-                SERVICE="联通"
-                break
-                ;;
-            4)
-                SERVICE="校园网"
-                break
-                ;;
-            *)
-                warn "请输入 1、2、3 或 4。"
-                ;;
-        esac
-    done
-}
+            try:
+                status, body = self.request(probe["url"], timeout=min(3, self.config["request_timeout"]))
+                if status == probe["status"] and probe.get("contains", "") in body:
+                    return {"kind": "online", "reason": "HTTPS 外网探测通过"}
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass
+        return {"kind": "unknown", "reason": "外网探测未通过，等待网络或门户恢复"}
 
-service_to_number() {
-    case "$1" in
-        移动) echo "1" ;;
-        电信) echo "2" ;;
-        联通) echo "3" ;;
-        校园网) echo "4" ;;
-        *) echo "?" ;;
-    esac
-}
+    def login(self, account, query):
+        portal = self.config["portal"].rstrip("/")
+        _, body = self.request(portal + "/eportal/InterFace.do?method=login", fields={
+            "userId": account["username"], "password": account["password"], "service": account["service"],
+            "queryString": query, "operatorPwd": "", "operatorUserId": "", "validcode": "", "passwordEncrypt": "false",
+        }, headers={
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent": "Mozilla/5.0 (X11; Linux aarch64)",
+            "Referer": portal + "/eportal/index.jsp?" + query, "Origin": portal,
+        })
+        result = json.loads(body)
+        if not isinstance(result, dict):
+            raise ValueError("认证响应必须是对象")
+        return result
 
-# ============================================================================
-# 登录
-# ============================================================================
+    def logout(self, user_index):
+        _, body = self.request(self.config["portal"].rstrip("/") + "/eportal/InterFace.do?method=logout",
+                               fields={"userIndex": user_index})
+        result = json.loads(body)
+        if not isinstance(result, dict):
+            raise ValueError("下线响应必须是对象")
+        return result
 
-do_login() {
-    local user="${1:-}"
-    local pass="${2:-}"
-    local service_number="${3:-}"
 
-    title "校园网认证"
+def inspect_network(interface=""):
+    import fcntl
+    import struct
 
-    # ------------------------------------------------------------------------
-    # 读取历史账号
-    # ------------------------------------------------------------------------
+    routes = []
+    for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+        row = line.split()
+        if len(row) >= 8 and row[1] == "00000000" and int(row[3], 16) & 1:
+            routes.append(row)
+    routes.sort(key=lambda row: int(row[6]))
+    route = next((row for row in routes if not interface or row[0] == interface), None)
+    interface = interface or (route[0] if route else "")
+    carrier, address = "unknown", ""
+    if interface:
+        try:
+            carrier = (Path("/sys/class/net") / interface / "carrier").read_text().strip()
+        except OSError:
+            pass
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                answer = fcntl.ioctl(sock.fileno(), 0x8915, struct.pack("256s", interface.encode()[:15]))
+                address = socket.inet_ntoa(answer[20:24])
+        except OSError:
+            pass
+    ready = bool(interface and route and address and carrier != "0")
+    return {"ready": ready, "interface": interface, "link": carrier != "0",
+            "signature": (interface, carrier, address, tuple(route) if route else ()),
+            "reason": "网线未连接" if carrier == "0" else "等待网卡、IPv4 地址和默认路由"}
 
-    if [ -z "$user" ] && [ -z "$pass" ] && [ -z "$service_number" ]; then
-        if load_account_config; then
-            user="$USER"
-            pass="$PASS"
-            SERVICE="$SERVICE"
 
-            info "使用上次保存的账号"
-            printf "  账号：${BOLD}%s${RESET}\n" "$user"
-            printf "  运营商：${BOLD}%s${RESET}\n" "$SERVICE"
-        else
-            info "未找到已保存的账号，请输入登录信息。"
+class Controller:
+    def __init__(self, config, state_dir, account_path, portal=None, network=None, clock=time.monotonic, rng=random.uniform):
+        self.config = dict(DEFAULT_CONFIG, **config)
+        self.state_dir, self.account_path = Path(state_dir), Path(account_path)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.state_dir / "state.json"
+        self.state = read_json(self.state_path, {"mode": "off", "session": "", "generation": 0})
+        if (self.state.get("mode") not in ("on", "off") or not isinstance(self.state.get("session"), str)
+                or not isinstance(self.state.get("generation"), int)):
+            raise ValueError("持久状态损坏，请检查 state.json；为避免抢占账号，拒绝自动登录")
+        self.portal = portal or Portal(self.config)
+        self.network = network or (lambda: inspect_network(self.config["interface"]))
+        self.clock, self.rng = clock, rng
+        self.lock, self.wake = threading.RLock(), threading.Event()
+        self.failures, self.next_action, self.last_network = 0, 0, None
+        self.heartbeat = time.time()
+        self.status = {"state": "starting", "reason": "正在检查", "last_online": None, "changed_at": time.time()}
 
-            read -r -p "账号： " user
+    def _save(self, **updates):
+        state = dict(self.state, **updates)
+        atomic_json(self.state_path, state)
+        self.state = state
 
-            while [ -z "$user" ]; do
-                warn "账号不能为空。"
-                read -r -p "账号： " user
-            done
+    def _account(self):
+        try:
+            value = read_json(self.account_path)
+            return valid_account(value) if value is not None else None
+        except (OSError, ValueError, TypeError):
+            return None
 
-            read -r -s -p "密码： " pass
-            echo
+    def _report(self, state, reason):
+        with self.lock:
+            account = self._account()
+            reason = str(reason)
+            for secret in ((account or {}).get("password"), self.state["session"]):
+                if secret:
+                    reason = reason.replace(secret, "***")
+            reason = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(reason))[:240]
+            if state != self.status["state"] or reason != self.status["reason"]:
+                self.status.update(state=state, reason=reason, changed_at=time.time())
+                logging.info("%s: %s", state, reason)
+            if state == "online":
+                self.status["last_online"] = time.time()
 
-            while [ -z "$pass" ]; do
-                warn "密码不能为空。"
-                read -r -s -p "密码： " pass
-                echo
-            done
+    def snapshot(self):
+        with self.lock:
+            account = self._account()
+            status = dict(self.status)
+            if time.time() - self.heartbeat > 25:
+                status.update(state="service-unresponsive", reason="守护循环长时间无响应，等待 systemd 恢复；联网状态未知")
+            return dict(status, mode=self.state["mode"], version=VERSION, configured=bool(account),
+                        username=(account or {}).get("username", ""), service=(account or {}).get("service", ""),
+                        retry_in=round(max(0, self.next_action - self.clock()), 1), failures=self.failures,
+                        pending_release=bool(self.state["mode"] == "off" and (self.state["session"] or self.state.get("uncertain"))),
+                        heartbeat=self.heartbeat, pid=os.getpid())
 
-            choose_service
-        fi
+    def command(self, request):
+        action = request.get("command")
+        if action not in ("on", "off", "status"):
+            raise ValueError("仅支持 on、off、status")
+        with self.lock:
+            if action != "status":
+                if action == "on":
+                    if "account" in request:
+                        if self.state["mode"] == "on" or self.state["session"] or self.state.get("uncertain"):
+                            raise ValueError("请先 off 并确认会话已释放，再更换账号")
+                        atomic_json(self.account_path, valid_account(request["account"]))
+                    if not self._account():
+                        return {"needs_account": True}
+                if self.state["mode"] != action:
+                    self._save(mode=action, generation=self.state["generation"] + 1)
+                    self.failures, self.next_action = 0, 0
+                    self._report("checking" if action == "on" else "releasing" if self.state["session"] or self.state.get("uncertain") else "idle",
+                                 "已启用持续联网" if action == "on" else "已禁止新的登录，正在处理已有请求和会话")
+                self.wake.set()
+            return self.snapshot()
 
-    else
-        # --------------------------------------------------------------------
-        # 部分参数：补齐剩余参数
-        # --------------------------------------------------------------------
+    def _retry(self, state, reason):
+        with self.lock:
+            ceiling = min(self.config["retry_max"], self.config["retry_base"] * 2 ** min(self.failures, 30))
+            self.failures += 1
+            self.next_action = self.clock() + self.rng(ceiling / 2, ceiling)
+            self._report(state, reason)
 
-        if [ -z "$user" ]; then
-            read -r -p "账号： " user
-        fi
+    def step(self):
+        network = self.network()
+        with self.lock:
+            signature = network["signature"]
+            if signature != self.last_network:
+                self.last_network = signature
+                self.failures = 0
+                self.next_action = self.clock() + self.rng(0, self.config["initial_jitter"])
+            mode, generation, session = self.state["mode"], self.state["generation"], self.state["session"]
+            self.portal.interface = network.get("interface", "") or self.config["interface"]
+            if mode == "off" and not session:
+                self._report("release-unconfirmed" if self.state.get("uncertain") else "idle",
+                             "已禁止登录；上次认证结果未知且无会话索引，无法确认远端释放" if self.state.get("uncertain") else "已禁止登录，无待释放会话")
+                return
+            if not network["ready"]:
+                self._report("waiting-link" if not network["link"] else "waiting-network",
+                             network["reason"] + ("；会话待释放" if mode == "off" else ""))
+                return
+            if self.clock() < self.next_action:
+                return
+            account = self._account() if mode == "on" else None
+            if mode == "on" and not account:
+                self._report("config-error", "账号未配置，请执行 campus-network on")
+                return
+        try:
+            if mode == "off":
+                self._report("releasing", "正在释放本机保存的会话")
+                result = self.portal.logout(session)
+                with self.lock:
+                    if result.get("result") == "success" or result.get("message") == "用户已不在线":
+                        self._save(session="")
+                        self.failures, self.next_action = 0, 0
+                        unknown = self.state.get("uncertain") and self.state["mode"] == "off"
+                        self._report("release-unconfirmed" if unknown else "idle" if self.state["mode"] == "off" else "checking",
+                                     "已释放已知会话；另有结果未知的认证，无法确认远端释放" if unknown else "已有会话已释放")
+                    elif self.state["generation"] == generation:
+                        self._retry("releasing", result.get("message") or "下线未成功，稍后重试")
+                return
+            self.portal.cancelled = lambda: self.state["generation"] != generation
+            result = self.portal.probe()
+            with self.lock:
+                if self.state["generation"] != generation:
+                    return
+                if result["kind"] == "online":
+                    self.failures = 0
+                    self.next_action = self.clock() + self.rng(self.config["check_interval"] * .8, self.config["check_interval"] * 1.2)
+                    self._report("online", result["reason"])
+                    return
+                if result["kind"] != "portal":
+                    self._retry("retrying", result["reason"])
+                    return
+                # Mark the operation in flight before releasing the control lock.
+                uncertain_before = self.state.get("uncertain", False)
+                self._save(uncertain=True)
+                self._report("authenticating", "正在提交校园网认证")
+            result = self.portal.login(account, result["query"])
+            with self.lock:
+                if result.get("result") == "success" and result.get("userIndex"):
+                    self._save(session=str(result["userIndex"]), uncertain=False)
+                    if self.state["mode"] == "on":
+                        self._retry("checking", "认证成功，等待外网确认")
+                    else:
+                        self.failures, self.next_action = 0, 0
+                        self._report("releasing", "认证期间收到 off，立即释放会话")
+                    self.wake.set()
+                else:
+                    if result.get("result") != "success":
+                        self._save(uncertain=uncertain_before)
+                    if self.state["generation"] == generation:
+                        self._retry("retrying", result.get("message") or "认证失败或未返回会话索引")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            with self.lock:
+                if self.state["generation"] == generation:
+                    reason = "请求超时，远端结果待确认" if isinstance(exc, subprocess.TimeoutExpired) else "请求失败，稍后重试"
+                    self._retry("releasing" if mode == "off" else "retrying", reason)
 
-        if [ -z "$pass" ]; then
-            read -r -s -p "密码： " pass
-            echo
-        fi
 
-        if [ -z "$service_number" ]; then
-            choose_service
-        else
-            case "$service_number" in
-                1) SERVICE="移动" ;;
-                2) SERVICE="电信" ;;
-                3) SERVICE="联通" ;;
-                4) SERVICE="校园网" ;;
-                *)
-                    error "无效的运营商编号：$service_number"
-                    error "有效编号：1、2、3、4"
-                    exit 2
-                    ;;
-            esac
-        fi
-    fi
+def notify(message):
+    address = os.environ.get("NOTIFY_SOCKET")
+    if address:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.sendto(message.encode(), "\0" + address[1:] if address.startswith("@") else address)
+        except OSError:
+            pass
 
-    # ------------------------------------------------------------------------
-    # 参数检查
-    # ------------------------------------------------------------------------
 
-    if [ -z "$user" ]; then
-        error "账号不能为空。"
-        exit 2
-    fi
+def read_message(stream):
+    line = stream.readline(8193)
+    if not line.endswith(b"\n") or len(line) > 8192:
+        raise ValueError("控制消息过长或不完整")
+    value = json.loads(line)
+    if not isinstance(value, dict):
+        raise ValueError("控制消息必须是对象")
+    return value
 
-    if [ -z "$pass" ]; then
-        error "密码不能为空。"
-        exit 2
-    fi
 
-    if [ -z "${SERVICE:-}" ]; then
-        error "运营商不能为空。"
-        exit 2
-    fi
+def daemon():
+    import fcntl
+    import socketserver
 
-    printf "\n"
-    info "正在检测网络..."
+    if os.geteuid() != 0:
+        raise ValueError("守护进程由 systemd 以 root 启动；日常命令无需 sudo")
+    os.umask(0o077)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    RUNTIME_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    RUNTIME_DIR.chmod(0o755)
+    lock = (RUNTIME_DIR / "daemon.lock").open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    migrate_legacy(CONFIG_DIR / "account.json", STATE_DIR)
+    config = load_config(CONFIG_DIR / "config.json")
+    control = Controller(config, STATE_DIR, CONFIG_DIR / "account.json")
 
-    local response=""
-    local curl_exit=0
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            self.request.settimeout(2)
+            try:
+                result = control.command(read_message(self.rfile))
+            except (OSError, ValueError, TypeError, KeyError):
+                result = {"error": "请求无效或配置不可读，请检查服务日志与账号配置"}
+            try:
+                self.wfile.write((json.dumps(result, ensure_ascii=False) + "\n").encode())
+            except OSError:
+                pass
 
-    response=$(curl -s --max-time 10 "$TEST_URL") || curl_exit=$?
+    endpoint = RUNTIME_DIR / "control.sock"
+    endpoint.unlink(missing_ok=True)
+    class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
 
-    if echo "$response" | grep -q "index\.jsp?"; then
+    server = Server(str(endpoint), Handler)
+    endpoint.chmod(0o666)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .2}, daemon=True)
+    thread.start()
+    stopping = threading.Event()
 
-        local qs
-        qs=$(echo "$response" | grep -oP "index\.jsp\?\K[^'\"]+")
+    def stop(*_):
+        stopping.set()
+        control.wake.set()
 
-        info "检测到校园网认证门户"
-        info "正在认证 ${BOLD}${user}${RESET} @ ${BOLD}${SERVICE}${RESET}..."
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        while not stopping.is_set():
+            control.wake.clear()
+            if not thread.is_alive():
+                raise RuntimeError("控制服务意外退出")
+            control.step()
+            control.heartbeat = time.time()
+            notify("WATCHDOG=1")
+            control.wake.wait(1)
+    finally:
+        server.shutdown()
+        server.server_close()
+        endpoint.unlink(missing_ok=True)
+        lock.close()
 
-        local result
 
-        result=$(curl -s -X POST \
-            "${PORTAL}/eportal/InterFace.do?method=login" \
-            -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
-            -H "User-Agent: Mozilla/5.0 (X11; Linux aarch64)" \
-            -H "Referer: ${PORTAL}/eportal/index.jsp?${qs}" \
-            -H "Origin: ${PORTAL}" \
-            --data-urlencode "userId=${user}" \
-            --data-urlencode "password=${pass}" \
-            --data-urlencode "service=${SERVICE}" \
-            --data-urlencode "queryString=${qs}" \
-            -d "operatorPwd=" \
-            -d "operatorUserId=" \
-            -d "validcode=" \
-            -d "passwordEncrypt=false")
+def client(request):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(4)
+        sock.connect(str(RUNTIME_DIR / "control.sock"))
+        sock.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode())
+        with sock.makefile("rb") as stream:
+            result = read_message(stream)
+    if "error" in result:
+        raise ValueError(result["error"])
+    return result
 
-        if echo "$result" | grep -q '"result":"success"'; then
 
-            mkdir -p "$(dirname "$USER_INDEX")"
+def print_status(value):
+    labels = {"online": "在线", "idle": "不联网", "starting": "启动中", "checking": "检测中",
+              "waiting-link": "等待网线", "waiting-network": "等待网络", "authenticating": "认证中",
+              "retrying": "等待重试", "releasing": "释放会话中", "release-unconfirmed": "释放未确认",
+              "config-error": "配置错误", "service-unresponsive": "服务无响应"}
+    state = value.get("state", "starting")
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    text = labels.get(state, state)
+    if color:
+        text = "\033[%sm%s\033[0m" % ("32" if state == "online" else "36" if state == "idle" else "33", text)
+    print("目标：%s    实际：%s" % ("持续联网" if value["mode"] == "on" else "不联网", text))
+    print("原因：" + value["reason"])
+    if value.get("username"):
+        print("账号：%s @ %s" % (value["username"], value["service"]))
+    if value.get("pending_release"):
+        print("会话：待释放（已禁止新的登录）")
+    if value.get("retry_in", 0) > 0 and state != "online":
+        print("下次尝试：%.1f 秒后" % value["retry_in"])
+    if value.get("last_online"):
+        print("最近联网：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["last_online"])))
+    print("状态更新：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["changed_at"])))
 
-            echo "$result" |
-                grep -oP '"userIndex":"\K[^"]+' > "$USER_INDEX"
 
-            chmod 644 "$USER_INDEX"
-
-            save_account_config "$user" "$pass" "$SERVICE"
-
-            printf "\n"
-            success "认证成功"
-            printf "  账号：${BOLD}%s${RESET}\n" "$user"
-            printf "  运营商：${BOLD}%s${RESET}\n" "$SERVICE"
-
-        else
-            local errmsg
-            errmsg=$(echo "$result" | grep -oP '"message":"\K[^"]+' || true)
-
-            printf "\n"
-            error "认证失败"
-            [ -n "$errmsg" ] && printf "  原因：%s\n" "$errmsg"
-
-            return 1
-        fi
-
-    elif [ "$curl_exit" -eq 0 ] && [ -n "$response" ]; then
-
-        success "当前已在线"
-
-    elif curl -s --max-time 5 "$FALLBACK_URL" | grep -q "百度"; then
-
-        success "当前已在线"
-
-    else
-
-        error "网络异常，无法连接外网"
-        return 1
-
-    fi
-}
-
-# ============================================================================
-# 下线
-# ============================================================================
-
-do_logout() {
-    title "校园网下线"
-
-    if [ ! -f "$USER_INDEX" ] || [ ! -s "$USER_INDEX" ]; then
-        warn "没有找到当前登录记录"
+def main():
+    parser = argparse.ArgumentParser(description="校园网持续联网管理；on/off/status 均无需 sudo")
+    parser.add_argument("command", nargs="?", choices=("on", "off", "status"), default="status")
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--json", action="store_true", help="输出 JSON 状态")
+    parser.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        if args.daemon:
+            daemon()
+            return 0
+        result = client({"command": args.command})
+        if result.get("needs_account"):
+            if not sys.stdin.isatty() or args.json:
+                raise ValueError("尚未配置账号，请在终端执行 campus-network on 完成首次配置")
+            username = input("校园网账号：").strip()
+            password = getpass.getpass("校园网密码：")
+            choice = input("运营商 [1 移动 / 2 电信 / 3 联通 / 4 校园网]：").strip()
+            service = SERVICES[int(choice) - 1] if choice in ("1", "2", "3", "4") else choice
+            account = valid_account({"username": username, "password": password, "service": service})
+            result = client({"command": "on", "account": account})
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print_status(result)
         return 0
-    fi
+    except (ConnectionError, FileNotFoundError, socket.timeout):
+        print("服务不可用，当前联网状态未知；请管理员检查 systemctl status campus-network", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        print("错误：%s" % exc, file=sys.stderr)
+    except (KeyboardInterrupt, EOFError):
+        print("\n已取消", file=sys.stderr)
+    return 1
 
-    local user_index
-    user_index=$(tr -d '\n' < "$USER_INDEX")
 
-    info "正在下线..."
-
-    local response
-
-    response=$(curl -s -X POST \
-        "${PORTAL}/eportal/InterFace.do?method=logout" \
-        -d "userIndex=$user_index")
-
-    if echo "$response" | grep -q '"result":"success"'; then
-
-        rm -f "$USER_INDEX"
-        success "下线成功"
-
-    elif echo "$response" | grep -q '"message":"用户已不在线"'; then
-
-        rm -f "$USER_INDEX"
-        warn "当前账号已经离线"
-
-    else
-
-        error "下线失败"
-        return 1
-
-    fi
-}
-
-# ============================================================================
-# 重新认证
-# ============================================================================
-
-do_relogin() {
-    title "重新认证"
-
-    do_logout || warn "下线未成功，继续尝试登录..."
-
-    sleep 2
-
-    do_login
-}
-
-# ============================================================================
-# 状态
-# ============================================================================
-
-do_status() {
-    title "校园网状态"
-
-    if [ -f "$USER_INDEX" ] && [ -s "$USER_INDEX" ]; then
-        success "存在登录记录"
-    else
-        info "没有登录记录"
-    fi
-
-    if load_account_config; then
-        printf "\n"
-        printf "  账号：${BOLD}%s${RESET}\n" "$USER"
-        printf "  运营商：${BOLD}%s${RESET}\n" "$SERVICE"
-    else
-        printf "\n"
-        info "尚未保存校园网账号"
-    fi
-}
-
-# ============================================================================
-# 配置
-# ============================================================================
-
-do_config() {
-    title "校园网配置"
-
-    printf "  公共配置：${BOLD}%s${RESET}\n" "$SYSTEM_CONFIG"
-    printf "  账号配置：${BOLD}%s${RESET}\n" "$ACCOUNT_CONFIG"
-    printf "  登录状态：${BOLD}%s${RESET}\n" "$USER_INDEX"
-
-    if [ -f "$SYSTEM_CONFIG" ]; then
-        printf "  配置版本：${BOLD}%s${RESET}\n" "${CONFIG_VERSION:-未知}"
-    fi
-
-    if load_account_config; then
-        printf "  当前账号：${BOLD}%s${RESET}\n" "$USER"
-        printf "  当前运营商：${BOLD}%s${RESET}\n" "$SERVICE"
-    else
-        printf "  当前账号：${DIM}未设置${RESET}\n"
-    fi
-}
-
-# ============================================================================
-# 主入口
-# ============================================================================
-
-main() {
-    load_system_config
-
-    local command="${1:-help}"
-
-    case "$command" in
-
-        login)
-            shift
-
-            if [ "$#" -gt 3 ]; then
-                error "login 最多接受三个参数。"
-                printf "\n"
-                show_help
-                exit 2
-            fi
-
-            do_login "${1:-}" "${2:-}" "${3:-}"
-            ;;
-
-        logout)
-            [ "$#" -eq 1 ] || {
-                error "logout 不接受参数。"
-                exit 2
-            }
-
-            do_logout
-            ;;
-
-        relogin)
-            [ "$#" -eq 1 ] || {
-                error "relogin 不接受参数。"
-                exit 2
-            }
-
-            do_relogin
-            ;;
-
-        status)
-            [ "$#" -eq 1 ] || {
-                error "status 不接受参数。"
-                exit 2
-            }
-
-            do_status
-            ;;
-
-        config)
-            [ "$#" -eq 1 ] || {
-                error "config 不接受参数。"
-                exit 2
-            }
-
-            do_config
-            ;;
-
-        version|--version|-v)
-            printf "%s\n" "$VERSION"
-            ;;
-
-        help|--help|-h)
-            show_help
-            ;;
-
-        *)
-            error "未知命令：$command"
-            printf "\n"
-            show_help
-            exit 2
-            ;;
-
-    esac
-}
-
-main "$@"
+if __name__ == "__main__":
+    sys.exit(main())

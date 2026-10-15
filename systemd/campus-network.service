@@ -1,0 +1,27 @@
+[Unit]
+Description=Campus network connection manager
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/campus-network --daemon
+Restart=always
+RestartSec=1
+WatchdogSec=30
+NotifyAccess=main
+TimeoutStopSec=10
+TimeoutAbortSec=5
+StateDirectory=campus-network
+StateDirectoryMode=0700
+RuntimeDirectory=campus-network
+RuntimeDirectoryMode=0755
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/campus-network
+
+[Install]
+WantedBy=multi-user.target
