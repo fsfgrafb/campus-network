@@ -4,12 +4,12 @@
 
 ## 安装：只下载一个包
 
-从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载唯一的安装包 **`campus-network_2.2.0_linux.tar.gz`**。无需选择 deb / rpm，也无需提前判断 Debian 版本或 CPU 架构。另一个 `SHA256SUMS` 文件仅用于手动校验。
+从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载唯一的安装包 **`campus-network_2.2.1_linux.tar.gz`**。无需选择 deb / rpm，也无需提前判断 Debian 版本或 CPU 架构。另一个 `SHA256SUMS` 文件仅用于手动校验。
 
 假设目标服务器已经有 **Python ≥ 3.9 和 systemd**。将安装包传到任意目录，执行一行：
 
 ```bash
-tar -xzf campus-network_2.2.0_linux.tar.gz && sudo sh campus-network-2.2.0/install.sh
+tar -xzf campus-network_2.2.1_linux.tar.gz && sudo sh campus-network-2.2.1/install.sh
 ```
 
 安装器自动识别系统版本与 CPU，在 Debian 12 / 13 的 amd64 / arm64 上，从包内对应的本地仓库补齐 curl、CA 根证书及所需依赖，全程无需外网。系统已有且满足要求的依赖会保留，不安装其他系统或架构的依赖，也不捆绑、替换 Python。
@@ -18,11 +18,11 @@ tar -xzf campus-network_2.2.0_linux.tar.gz && sudo sh campus-network-2.2.0/insta
 
 其他使用 systemd 的 Linux 可以使用同一包，但需要预装 curl 和有效的系统 CA 证书。安装器选择原生 deb / rpm 或通用安装方式；不支持 Windows、macOS、OpenWrt 或没有 systemd 的系统。
 
-安装后默认**不联网**，不会主动占用校园网账号。首次执行：
+安装后默认**离线**，不会主动占用校园网账号。首次执行：
 
 ```bash
 campus-network config   # 输入账号、密码、运营商
-campus-network on       # 开始持续联网
+campus-network on       # 启用保持在线模式
 ```
 
 按提示输入账号、密码、运营商，之后自动复用。升级保留配置和联网意愿。密码不会回显，不需要写入命令行或 shell 历史。
@@ -31,9 +31,9 @@ campus-network on       # 开始持续联网
 
 ```bash
 campus-network config   # 设置或更换唯一的校园网账号
-campus-network on       # 持久化开启持续联网
-campus-network off      # 先持久化禁止登录，再尝试释放已有会话
-campus-network status   # 查看目标模式、实际状态、原因、时间和下次尝试
+campus-network on       # 保持在线，断开后自动重连
+campus-network off      # 保持离线，停用自动认证并注销会话
+campus-network status   # 查看运行模式、连接状态、说明和时间
 ```
 
 所有能登录服务器的本机用户都可以使用这四条命令，无需加入用户组，也无需 sudo。它们通过 Unix socket 控制唯一的服务进程；账号文件仍仅 root 可读。这个权限模型适用于本机用户均为可信内部人员的服务器。
@@ -50,12 +50,23 @@ campus-network --help
 
 ## 状态与恢复
 
-目标模式和实际联网状态独立显示：
+运行模式与实际连接状态独立显示。例如主动离线后：
 
-- **on**：重启后继续保持联网。拔插网线、网络地址变化、认证失效时持续检测并尝试恢复。
-- **off**：重启后仍禁止发起任何新登录。已发送的认证若随后成功，会立即安排下线；无网时保留待释放会话，恢复后继续下线。
+```text
+模式：保持离线    状态：离线
+说明：自动认证已停用，无待注销会话
+账号：your-account @ 移动
+最近在线：2026-10-15 22:45:49
+状态更新：2026-10-15 22:45:54
+```
 
-`off` 返回表示“不再登录”的意愿已经保存，不代表认证服务器已经确认账号释放。状态中的“会话待释放”会一直保留到明确下线成功或确认会话失效。断电、拔网线期间无法向服务器发送下线请求，远端释放时间也受校园网会话超时影响。
+“保持在线”表示持续检查并恢复连接；“保持离线”表示停用自动认证并注销已有会话。注销未确认时会单独显示，不会误报注销完成。JSON 字段和状态标识保持兼容。
+
+
+- **on**：重启后继续保持在线。拔插网线、网络地址变化、认证失效时持续检测并尝试恢复。
+- **off**：重启后仍禁止发起任何新登录。已发送的认证若随后成功，会立即安排注销；无网时保留待注销会话，恢复后继续注销。
+
+`off` 返回表示“不再登录”的意愿已经保存，不代表认证服务器已经确认会话注销。状态中的“等待注销确认”会一直保留到明确注销成功或确认会话失效。断电、拔网线期间无法向服务器发送注销请求，服务器注销确认时间也受校园网会话超时影响。
 
 | 实际状态 | 含义 |
 | --- | --- |
@@ -67,14 +78,14 @@ campus-network --help
 | `retrying` | 本轮失败，退避后继续尝试 |
 | `releasing` | 禁止新登录，正在释放已有会话 |
 | `release-unconfirmed` | 认证响应丢失且没有会话索引；已禁止新登录，但无法确认远端释放 |
-| `idle` | 不联网，没有待释放会话 |
+| `idle` | 离线，没有待注销会话 |
 | `config-error` | 配置缺失或不正确 |
 
-服务每秒检查本地网络变化，在线时约每 3 秒检查外网；任一有效外网探测通过即可判定在线。只有确认进入认证门户才登录，不会因为某个站点暂时不可达就先下线。网卡、DHCP 和路由仍由 Debian 原有网络管理器负责。
+服务每秒检查本地网络变化，在线时约每 3 秒检查外网；任一有效外网探测通过即可判定在线。只有确认进入认证门户才登录，不会因为某个站点暂时不可达就先注销。网卡、DHCP 和路由仍由 Debian 原有网络管理器负责。
 
 认证失败使用有上限的指数退避：第 n 次失败（从 0 计数）的上限为 `min(2 × 2ⁿ, 120)` 秒，从该上限的 1/2 到上限之间随机选择等待时间。持续故障时每轮等待 60–120 秒，等待期间仍响应命令并检查本地链路。链路、地址或路由变化后加 0–3 秒随机扰动重新检测；健康探测间隔也有随机扰动，避免大量设备同时请求认证服务器。反复执行 `on` 不会绕过已有失败退避。
 
-所有 HTTP 请求都有超时；恢复速度取决于交换机、DHCP 和认证服务器。systemd 在进程退出后约 1 秒重启；主循环 30 秒没有 watchdog 心跳时会重启服务。服务启动、升级和进程重启不主动下线，避免破坏可用会话。
+所有 HTTP 请求都有超时；恢复速度取决于交换机、DHCP 和认证服务器。systemd 在进程退出后约 1 秒重启；主循环 30 秒没有 watchdog 心跳时会重启服务。服务启动、升级和进程重启不主动注销，避免破坏可用会话。
 
 ## 配置与数据
 
@@ -95,11 +106,11 @@ campus-network --help
 sudo systemctl restart campus-network
 ```
 
-设置和更换账号都执行 `campus-network config`，无需 sudo。当前只保存一份全局账号，没有多账号或用户配置档案。输入并校验新信息后，命令先持久化关闭自动登录、等待旧会话释放，再替换账号；配置成功后保持 off，执行 `campus-network on` 才开始联网。若旧会话暂时无法释放，会保留原账号并给出提示，稍后再次执行 config 即可。输入期间取消不会修改原配置。密码不回显，状态和日志不返回密码。
+设置和更换账号都执行 `campus-network config`，无需 sudo。当前只保存一份全局账号，没有多账号或用户配置档案。输入并校验新信息后，命令先持久化关闭自动登录、等待旧会话注销，再替换账号；配置成功后保持 off，执行 `campus-network on` 才开始联网。若旧会话暂时无法注销，会保留原账号并给出提示，稍后再次执行 config 即可。输入期间取消不会修改原配置。密码不回显，状态和日志不返回密码。
 
 ### 从 1.x 升级
 
-安装包会修复旧版目录 / 账号文件的宽松权限，并迁移旧 `/etc/campus-network/account` 中的账号及 `/var/lib/campus-network/userindex` 会话；新 JSON 尚未自定义时，也会迁移旧门户和探测地址。旧版没有持久模式，首次迁移默认为 **off**，并尝试释放遗留会话；请确认后执行 `campus-network on`。已经由 2.x 保存的模式、账号和会话在升级时保留。
+安装包会修复旧版目录 / 账号文件的宽松权限，并迁移旧 `/etc/campus-network/account` 中的账号及 `/var/lib/campus-network/userindex` 会话；新 JSON 尚未自定义时，也会迁移旧门户和探测地址。旧版没有持久模式，首次迁移默认为 **off**，并尝试注销遗留会话；请确认后执行 `campus-network on`。已经由 2.x 保存的模式、账号和会话在升级时保留。
 
 旧的 `login/logout/relogin/keep` 命令由新命令替代；自动重连已内置在 `on`。旧配置文件暂保留供核对。
 
@@ -112,9 +123,9 @@ sudo journalctl -u campus-network -n 100 --no-pager
 sudo journalctl -u campus-network -f
 ```
 
-日志记录状态变化和经过限频的失败原因，不记录密码。服务不可用时 CLI 显示“联网状态未知”，不会把旧状态当作在线。
+日志记录状态变化和经过限频的失败原因，不记录密码。服务不可用时 CLI 显示“连接状态未知”，不会把旧状态当作在线。
 
-正常使用 `off` 释放账号；`systemctl stop` 是管理员维护动作，不会替代持久的 `off`。卸载前也先执行 `off` 并确认会话已释放。Debian 卸载使用 `sudo apt-get remove campus-network`，保留账号和状态供以后恢复。
+正常使用 `off` 注销会话；`systemctl stop` 是管理员维护动作，不会替代持久的 `off`。卸载前也先执行 `off` 并确认会话已注销。Debian 卸载使用 `sudo apt-get remove campus-network`，保留账号和状态供以后恢复。
 
 ## 构建与验证
 

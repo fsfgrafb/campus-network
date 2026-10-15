@@ -22,7 +22,7 @@ import threading
 import time
 from urllib.parse import quote, urlencode, urlsplit
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 CONFIG_DIR = Path("/etc/campus-network")
 STATE_DIR = Path("/var/lib/campus-network")
 RUNTIME_DIR = Path("/run/campus-network")
@@ -185,7 +185,7 @@ class Portal:
             _, body = self.request(self.config["test_url"], timeout=min(3, self.config["request_timeout"]))
             match = re.search(r"index\.jsp\?([^'\"<>\s]+)", body)
             if match:
-                return {"kind": "portal", "query": html.unescape(match[1]), "reason": "需要校园网认证"}
+                return {"kind": "portal", "query": html.unescape(match[1]), "reason": "需要进行校园网认证"}
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
         for probe in self.config["probe_urls"]:
@@ -194,10 +194,10 @@ class Portal:
             try:
                 status, body = self.request(probe["url"], timeout=min(3, self.config["request_timeout"]))
                 if status == probe["status"] and probe.get("contains", "") in body:
-                    return {"kind": "online", "reason": "HTTPS 外网探测通过"}
+                    return {"kind": "online", "reason": "外网连通性检查通过"}
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 pass
-        return {"kind": "unknown", "reason": "外网探测未通过，等待网络或门户恢复"}
+        return {"kind": "unknown", "reason": "外网连通性检查未通过，等待网络或认证服务恢复"}
 
     def login(self, account, query):
         portal = self.config["portal"].rstrip("/")
@@ -219,7 +219,7 @@ class Portal:
                                fields={"userIndex": user_index})
         result = json.loads(body)
         if not isinstance(result, dict):
-            raise ValueError("下线响应必须是对象")
+            raise ValueError("注销响应必须是对象")
         return result
 
 
@@ -250,7 +250,7 @@ def inspect_network(interface=""):
     ready = bool(interface and route and address and carrier != "0")
     return {"ready": ready, "interface": interface, "link": carrier != "0",
             "signature": (interface, carrier, address, tuple(route[i] for i in (0, 1, 2, 3, 6, 7)) if route else ()),
-            "reason": "网线未连接" if carrier == "0" else "等待网卡、IPv4 地址和默认路由"}
+            "reason": "网络链路未连接" if carrier == "0" else "等待网卡、IPv4 地址或默认路由就绪"}
 
 
 class Controller:
@@ -302,7 +302,7 @@ class Controller:
             account = self._account()
             status = dict(self.status)
             if time.time() - self.heartbeat > 25:
-                status.update(state="service-unresponsive", reason="守护循环长时间无响应，等待 systemd 恢复；联网状态未知")
+                status.update(state="service-unresponsive", reason="连接管理服务响应超时，等待 systemd 恢复；连接状态未知")
             return dict(status, mode=self.state["mode"], version=VERSION, configured=bool(account),
                         username=(account or {}).get("username", ""), service=(account or {}).get("service", ""),
                         retry_in=round(max(0, self.next_action - self.clock()), 1), failures=self.failures,
@@ -317,9 +317,9 @@ class Controller:
             if action == "config":
                 account = valid_account(request.get("account"))
                 if self.state["mode"] != "off" or self.state["session"] or self.state.get("uncertain"):
-                    raise ValueError("旧会话尚未释放或联网已重新启用，保留原账号；请稍后重试 config")
+                    raise ValueError("旧会话尚未注销或在线模式已重新启用，原账号保持不变；请稍后重试 config")
                 atomic_json(self.account_path, account)
-                self._report("idle", "账号已保存；执行 campus-network on 开始联网")
+                self._report("idle", "账号配置已保存；执行 campus-network on 启用在线模式")
                 return self.snapshot()
             if action != "status":
                 if action == "on":
@@ -331,7 +331,7 @@ class Controller:
                     self._save(mode=action, generation=self.state["generation"] + 1)
                     self.failures, self.next_action = 0, 0
                     self._report("checking" if action == "on" else "releasing" if self.state["session"] or self.state.get("uncertain") else "idle",
-                                 "已启用持续联网" if action == "on" else "已禁止新的登录，正在处理已有请求和会话")
+                                 "已启用在线模式，将自动维持网络连接" if action == "on" else "已启用离线模式，自动认证已停用")
                 self.wake.set()
             return self.snapshot()
 
@@ -354,11 +354,11 @@ class Controller:
             self.portal.interface = network.get("interface", "") or self.config["interface"]
             if mode == "off" and not session:
                 self._report("release-unconfirmed" if self.state.get("uncertain") else "idle",
-                             "已禁止登录；上次认证结果未知且无会话索引，无法确认远端释放" if self.state.get("uncertain") else "已禁止登录，无待释放会话")
+                             "自动认证已停用；上次认证结果未知，缺少会话标识，无法确认注销状态" if self.state.get("uncertain") else "自动认证已停用，无待注销会话")
                 return
             if not network["ready"]:
                 self._report("waiting-link" if not network["link"] else "waiting-network",
-                             network["reason"] + ("；会话待释放" if mode == "off" else ""))
+                             network["reason"] + ("；现有会话等待注销" if mode == "off" else ""))
                 return
             if self.clock() < self.next_action:
                 return
@@ -368,7 +368,7 @@ class Controller:
                 return
         try:
             if mode == "off":
-                self._report("releasing", "正在释放本机保存的会话")
+                self._report("releasing", "正在向认证服务器提交注销请求")
                 result = self.portal.logout(session)
                 with self.lock:
                     if result.get("result") == "success" or result.get("message") == "用户已不在线":
@@ -376,9 +376,9 @@ class Controller:
                         self.failures, self.next_action = 0, 0
                         unknown = self.state.get("uncertain") and self.state["mode"] == "off"
                         self._report("release-unconfirmed" if unknown else "idle" if self.state["mode"] == "off" else "checking",
-                                     "已释放已知会话；另有结果未知的认证，无法确认远端释放" if unknown else "已有会话已释放")
+                                     "已注销已知会话；另一次认证结果未知，注销状态尚未确认" if unknown else "会话注销完成")
                     elif self.state["generation"] == generation:
-                        self._retry("releasing", result.get("message") or "下线未成功，稍后重试")
+                        self._retry("releasing", result.get("message") or "会话注销失败，将按重试计划重新尝试")
                 return
             self.portal.cancelled = lambda: self.state["generation"] != generation or not self.network()["ready"]
             result = self.portal.probe()
@@ -405,10 +405,10 @@ class Controller:
                 if result.get("result") == "success" and result.get("userIndex"):
                     self._save(session=str(result["userIndex"]), uncertain=False)
                     if self.state["mode"] == "on":
-                        self._retry("checking", "认证成功，等待外网确认")
+                        self._retry("checking", "认证成功，等待外网连通性确认")
                     else:
                         self.failures, self.next_action = 0, 0
-                        self._report("releasing", "认证期间收到 off，立即释放会话")
+                        self._report("releasing", "认证期间已切换为离线模式，正在注销新会话")
                     self.wake.set()
                 else:
                     if result.get("result") != "success":
@@ -418,7 +418,7 @@ class Controller:
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             with self.lock:
                 if self.state["generation"] == generation:
-                    reason = "请求超时，远端结果待确认" if isinstance(exc, subprocess.TimeoutExpired) else "请求失败，稍后重试"
+                    reason = "请求超时，认证服务器处理结果尚未确认" if isinstance(exc, subprocess.TimeoutExpired) else "请求失败，将按重试计划重新尝试"
                     self._retry("releasing" if mode == "off" else "retrying", reason)
 
 
@@ -518,25 +518,25 @@ def client(request):
 
 
 def print_status(value):
-    labels = {"online": "在线", "idle": "不联网", "starting": "启动中", "checking": "检测中",
-              "waiting-link": "等待网线", "waiting-network": "等待网络", "authenticating": "认证中",
-              "retrying": "等待重试", "releasing": "释放会话中", "release-unconfirmed": "释放未确认",
+    labels = {"online": "在线", "idle": "离线", "starting": "启动中", "checking": "检查连接",
+              "waiting-link": "等待链路恢复", "waiting-network": "等待网络就绪", "authenticating": "认证中",
+              "retrying": "等待重试", "releasing": "正在注销", "release-unconfirmed": "注销未确认",
               "config-error": "配置错误", "service-unresponsive": "服务无响应"}
     state = value.get("state", "starting")
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
     text = labels.get(state, state)
     if color:
         text = "\033[%sm%s\033[0m" % ("32" if state == "online" else "36" if state == "idle" else "33", text)
-    print("目标：%s    实际：%s" % ("持续联网" if value["mode"] == "on" else "不联网", text))
-    print("原因：" + value["reason"])
+    print("模式：%s    状态：%s" % ("保持在线" if value["mode"] == "on" else "保持离线", text))
+    print("说明：" + value["reason"])
     if value.get("username"):
         print("账号：%s @ %s" % (value["username"], value["service"]))
     if value.get("pending_release"):
-        print("会话：待释放（已禁止新的登录）")
+        print("会话：等待注销确认（自动认证已停用）")
     if value.get("retry_in", 0) > 0 and state != "online":
-        print("下次尝试：%.1f 秒后" % value["retry_in"])
+        print("下次重试：%.1f 秒后" % value["retry_in"])
     if value.get("last_online"):
-        print("最近联网：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["last_online"])))
+        print("最近在线：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["last_online"])))
     print("状态更新：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["changed_at"])))
 
 
@@ -555,7 +555,7 @@ def configure():
     deadline = time.monotonic() + 15
     while status.get("pending_release"):
         if status.get("state") == "release-unconfirmed" or time.monotonic() >= deadline:
-            raise ValueError("旧会话尚未确认释放，原账号已保留且自动登录已关闭；稍后再次执行 config")
+            raise ValueError("旧会话注销尚未确认，原账号保持不变，自动认证已停用；请稍后再次执行 config")
         time.sleep(.2)
         status = client({"command": "status"})
     return client({"command": "config", "account": account})
@@ -584,7 +584,7 @@ def main():
             print_status(result)
         return 0
     except (ConnectionError, FileNotFoundError, socket.timeout):
-        print("服务不可用，当前联网状态未知；请管理员检查 systemctl status campus-network", file=sys.stderr)
+        print("连接管理服务不可用，当前连接状态未知；请检查 systemctl status campus-network", file=sys.stderr)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         print("错误：%s" % exc, file=sys.stderr)
     except (KeyboardInterrupt, EOFError):
