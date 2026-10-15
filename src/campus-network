@@ -244,7 +244,7 @@ def inspect_network(interface=""):
             pass
     ready = bool(interface and route and address and carrier != "0")
     return {"ready": ready, "interface": interface, "link": carrier != "0",
-            "signature": (interface, carrier, address, tuple(route) if route else ()),
+            "signature": (interface, carrier, address, tuple(route[i] for i in (0, 1, 2, 3, 6, 7)) if route else ()),
             "reason": "网线未连接" if carrier == "0" else "等待网卡、IPv4 地址和默认路由"}
 
 
@@ -370,10 +370,13 @@ class Controller:
                     elif self.state["generation"] == generation:
                         self._retry("releasing", result.get("message") or "下线未成功，稍后重试")
                 return
-            self.portal.cancelled = lambda: self.state["generation"] != generation
+            self.portal.cancelled = lambda: self.state["generation"] != generation or not self.network()["ready"]
             result = self.portal.probe()
             with self.lock:
                 if self.state["generation"] != generation:
+                    return
+                if self.network()["signature"] != signature:
+                    self.wake.set()
                     return
                 if result["kind"] == "online":
                     self.failures = 0

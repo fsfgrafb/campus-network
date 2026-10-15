@@ -50,6 +50,7 @@ class Portal:
         self.login_continue = None
         self.login_error = None
         self.logout_error = None
+        self.online_after_login = True
 
     def probe(self):
         self.calls.append(("probe",))
@@ -67,7 +68,7 @@ class Portal:
                 raise TimeoutError("test login was not released")
         if self.login_error is not None:
             raise self.login_error
-        if self.login_result.get("result") == "success":
+        if self.login_result.get("result") == "success" and self.online_after_login:
             self.probe_result = {"kind": "online", "reason": "external probe passed"}
         return dict(self.login_result)
 
@@ -136,6 +137,20 @@ class ControllerTests(unittest.TestCase):
             controller.step()
         self.assertEqual(controller.state["mode"], "off")
         self.assertEqual(self.portal.count("login"), 0)
+
+    def test_cable_removed_during_probe_prevents_login_with_stale_parameters(self):
+        controller = self.controller()
+        self.turn_on(controller)
+
+        def probe():
+            self.link = False
+            return {"kind": "portal", "query": "old-link-parameters"}
+
+        self.portal.probe = probe
+        controller.step()
+        self.assertEqual(self.portal.count("login"), 0)
+        controller.step()
+        self.assertEqual(controller.snapshot()["state"], "waiting-link")
 
     def test_enabled_mode_and_account_survive_restart(self):
         controller = self.controller()
@@ -305,6 +320,21 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(controller.next_action, deadline)
         self.assertEqual(controller.failures, failures)
         self.assertEqual(self.portal.count("login"), 1)
+
+    def test_successful_login_without_external_connectivity_also_backs_off(self):
+        controller = self.controller()
+        self.portal.online_after_login = False
+        self.turn_on(controller)
+        for attempt in range(10):
+            self.clock.advance()
+            controller.step()
+            delay = controller.next_action - self.clock()
+            ceiling = min(self.config["retry_max"], self.config["retry_base"] * 2 ** attempt)
+            self.assertGreaterEqual(delay, ceiling / 2)
+            self.assertLessEqual(delay, ceiling)
+            self.assertEqual(controller.failures, attempt + 1)
+            self.assertEqual(controller.snapshot()["state"], "checking")
+        self.assertEqual(self.portal.count("login"), 10)
 
     def test_online_checks_do_not_reauthenticate(self):
         controller = self.controller()
@@ -527,6 +557,49 @@ class ValidationTests(unittest.TestCase):
             values = campus_network.shell_values(path, ("PASS",))
             self.assertIn("$(touch ", values["PASS"])
             self.assertFalse(marker.exists())
+
+
+@unittest.skipUnless(sys.platform == "linux", "network inspection uses Linux procfs and ioctl")
+class NetworkInspectionTests(unittest.TestCase):
+    routes = """Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth-slow 00000000 0100000A 0003 0 0 100 00000000 0 0 0
+eth-fast 00000000 0100000A 0003 0 0 10 00000000 0 0 0
+"""
+
+    def inspect(self, interface="", carrier="1", address="10.1.2.3", routes=None):
+        def read_text(path, *args, **kwargs):
+            if str(path) == "/proc/net/route":
+                return self.routes if routes is None else routes
+            return carrier
+
+        answer = b"\0" * 20 + socket.inet_aton(address) if address else None
+        with patch.object(Path, "read_text", read_text):
+            with patch("fcntl.ioctl", return_value=answer, side_effect=None if address else OSError("no address")):
+                return campus_network.inspect_network(interface)
+
+    def test_default_interface_uses_lowest_metric_route(self):
+        result = self.inspect()
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["interface"], "eth-fast")
+
+    def test_explicit_interface_overrides_other_route(self):
+        result = self.inspect("eth-slow")
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["interface"], "eth-slow")
+
+    def test_route_usage_counters_do_not_trigger_reauthentication(self):
+        before = self.inspect()
+        after = self.inspect(routes=self.routes.replace("0003 0 0 10", "0003 1 500 10"))
+        self.assertEqual(before["signature"], after["signature"])
+
+    def test_disconnected_cable_is_not_ready(self):
+        result = self.inspect(carrier="0")
+        self.assertFalse(result["ready"])
+        self.assertFalse(result["link"])
+
+    def test_missing_ipv4_or_route_is_not_ready(self):
+        self.assertFalse(self.inspect(address="")["ready"])
+        self.assertFalse(self.inspect("eth-fast", routes="Iface Destination Gateway Flags RefCnt Use Metric Mask\n")["ready"])
 
 
 class MessageTests(unittest.TestCase):

@@ -170,6 +170,13 @@ class PortalContractTests(unittest.TestCase):
         ):
             self.assertEqual(self.portal.probe()["kind"], "online")
 
+    def test_disabled_or_disconnected_probe_stops_before_more_requests(self):
+        self.portal.cancelled = lambda: True
+        self.portal.config["probe_urls"] = [{"url": "https://probe.invalid/", "status": 204}]
+        with patch.object(self.portal, "request", side_effect=OSError("disconnected")) as request:
+            self.assertEqual(self.portal.probe()["kind"], "unknown")
+        request.assert_called_once()
+
 
 @unittest.skipUnless(shutil.which("curl"), "curl is required for loopback protocol tests")
 class CurlLoopbackTests(unittest.TestCase):
