@@ -558,6 +558,18 @@ class ValidationTests(unittest.TestCase):
             self.assertIn("$(touch ", values["PASS"])
             self.assertFalse(marker.exists())
 
+    def test_legacy_c_locale_utf8_octal_escapes_preserve_service_and_password(self):
+        def quoted(value):
+            return "$'" + "".join("\\%03o" % byte for byte in value.encode("utf-8")) + "'"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "account").write_text("USER=office\nPASS=" + quoted("中文密码") + "\nSERVICE=" + quoted("移动") + "\n")
+            campus_network.migrate_legacy(root / "account.json", root)
+            migrated = campus_network.read_json(root / "account.json")
+            self.assertEqual(migrated["service"], "移动")
+            self.assertEqual(migrated["password"], "中文密码")
+
 
 @unittest.skipUnless(sys.platform == "linux", "network inspection uses Linux procfs and ioctl")
 class NetworkInspectionTests(unittest.TestCase):

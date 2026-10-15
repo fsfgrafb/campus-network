@@ -79,6 +79,7 @@ BuildArch: noarch
 Requires: python3 >= 3.9
 Requires: /usr/bin/curl
 Requires: systemd
+Requires: ca-certificates
 AutoReqProv: no
 
 %description

@@ -22,7 +22,7 @@ import threading
 import time
 from urllib.parse import quote, urlencode, urlsplit
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 CONFIG_DIR = Path("/etc/campus-network")
 STATE_DIR = Path("/var/lib/campus-network")
 RUNTIME_DIR = Path("/run/campus-network")
@@ -111,6 +111,11 @@ def shell_values(path, keys):
         if separator and key in keys:
             if value.startswith("$'"):
                 values[key] = ast.literal_eval(value[1:].replace(r"\e", r"\x1b").replace(r"\E", r"\x1b"))
+                if value.isascii() and re.search(r"\\(?:[0-7]{3}|x[0-9a-fA-F]{2})", value):
+                    try:
+                        values[key] = values[key].encode("latin1").decode("utf-8")
+                    except UnicodeError:
+                        pass
             else:
                 parts = shlex.split(value, comments=False)
                 values[key] = parts[0] if len(parts) == 1 else ""

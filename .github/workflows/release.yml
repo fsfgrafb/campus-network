@@ -146,9 +146,11 @@ jobs:
         run: |
           docker run --rm -v "$PWD/dist:/artifacts:ro" debian:${{ matrix.version }}-slim sh -ec '
             apt-get update
-            apt-get install -y --no-install-recommends python3 curl systemd
+            apt-get install -y --no-install-recommends python3 curl systemd ca-certificates
             dpkg -i /artifacts/*.deb
             campus-network --version
+            test -s /etc/ssl/certs/ca-certificates.crt
+            python3 -c "import ssl; assert ssl.create_default_context().get_ca_certs()"
             systemctl is-enabled campus-network.service
             printf "{\"custom\":true}\n" > /etc/campus-network/config.json
             dpkg -i /artifacts/*.deb
@@ -166,9 +168,10 @@ jobs:
       - name: Check RPM install
         run: |
           docker run --rm -v "$PWD/dist:/artifacts:ro" fedora:43 sh -ec '
-            dnf install -y python3 curl-minimal systemd
+            dnf install -y python3 curl-minimal systemd ca-certificates
             rpm -ivh /artifacts/*.rpm
             campus-network --version
+            python3 -c "import ssl; assert ssl.create_default_context().get_ca_certs()"
             systemctl is-enabled campus-network.service
           '
 
@@ -201,6 +204,9 @@ jobs:
             tar -xzf /artifacts/*_debian${{ matrix.version }}_${{ matrix.arch }}_offline.tar.gz -C /tmp/offline
             sh /tmp/offline/campus-network_*/install.sh
             campus-network --version
+            test -s /etc/ssl/certs/ca-certificates.crt
+            test "$(dpkg-query -W -f=\${db:Status-Abbrev} ca-certificates)" = "ii "
+            python3 -c "import ssl; assert ssl.create_default_context().get_ca_certs()"
             systemctl is-enabled campus-network.service
           '
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

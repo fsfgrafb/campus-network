@@ -10,12 +10,12 @@
 . /etc/os-release; echo "Debian $VERSION_ID"; dpkg --print-architecture
 ```
 
-从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载匹配的完整离线包。例如 Debian 12、amd64 对应 `campus-network_2.0.0_debian12_amd64_offline.tar.gz`。提供 Debian 12 / 13 × amd64 / arm64 四种组合，内含 Python、curl、systemd 及其发行版依赖。
+从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载匹配的完整离线包。例如 Debian 12、amd64 对应 `campus-network_2.0.1_debian12_amd64_offline.tar.gz`。提供 Debian 12 / 13 × amd64 / arm64 四种组合，内含 Python、curl、systemd、HTTPS 所需的 CA 根证书及其发行版依赖。
 
 将压缩包传到服务器任意目录，在该目录执行一行：
 
 ```bash
-tar -xzf campus-network_2.0.0_debian12_amd64_offline.tar.gz && sudo sh campus-network_2.0.0_debian12_amd64_offline/install.sh
+tar -xzf campus-network_2.0.1_debian12_amd64_offline.tar.gz && sudo sh campus-network_2.0.1_debian12_amd64_offline/install.sh
 ```
 
 安装器校验系统版本、CPU 架构和包校验和，建立临时本地 APT 仓库，再使用 `--no-download` 安装；整个过程无需外网。已满足要求的系统依赖会保留。仅安装需要 root；日常命令均无需 sudo。没有 sudo 的服务器可切换为 root 执行同一安装命令。
@@ -32,21 +32,21 @@ campus-network on
 
 | 文件 | 用途 |
 | --- | --- |
-| `campus-network_2.0.0_all.deb` | 已有依赖的 Debian / Ubuntu；不区分 CPU 架构 |
-| `campus-network-2.0.0-1.noarch.rpm` | 已有依赖的 RPM 系 Linux；不区分 CPU 架构 |
-| `campus-network_2.0.0_linux-any.tar.gz` | 其他使用 systemd 的 Linux；内含通用安装脚本 |
+| `campus-network_2.0.1_all.deb` | 已有依赖的 Debian / Ubuntu；不区分 CPU 架构 |
+| `campus-network-2.0.1-1.noarch.rpm` | 已有依赖的 RPM 系 Linux；不区分 CPU 架构 |
+| `campus-network_2.0.1_linux-any.tar.gz` | 其他使用 systemd 的 Linux；内含通用安装脚本 |
 | `*_debian12_*_offline.tar.gz` / `*_debian13_*_offline.tar.gz` | 指定发行版和 CPU 的完整离线依赖包 |
 | `SHA256SUMS` | 所有发布文件的 SHA-256 校验和 |
 
-轻量包仅依赖 **Python ≥ 3.9、curl、systemd**。它们是解释执行程序，没有必要为每种 CPU 重复打包；amd64、arm64 及发行版提供上述依赖的其他架构使用同一份程序。不支持 Windows、macOS、OpenWrt 或没有 systemd 的容器运行环境。
+轻量包仅依赖 **Python ≥ 3.9、curl、systemd、ca-certificates**。它们是解释执行程序，没有必要为每种 CPU 重复打包；amd64、arm64 及发行版提供上述依赖的其他架构使用同一份程序。不支持 Windows、macOS、OpenWrt 或没有 systemd 的容器运行环境。
 
 依赖已安装时，Debian 一行离线安装：
 
 ```bash
-sudo dpkg -i ./campus-network_2.0.0_all.deb
+sudo dpkg -i ./campus-network_2.0.1_all.deb
 ```
 
-RPM：`sudo rpm -Uvh ./campus-network-2.0.0-1.noarch.rpm`。通用包：解压后执行 `sudo sh ./install.sh`。通用安装器会检查依赖，不会自动联网下载，也不会覆盖已有配置；已由 dpkg / RPM 管理的安装请继续使用对应包升级。
+RPM：`sudo rpm -Uvh ./campus-network-2.0.1-1.noarch.rpm`。通用包：解压后执行 `sudo sh ./install.sh`。HTTPS 外网探测必须有有效的 CA 根证书。通用安装器会检查依赖和证书，不会自动联网下载，也不会覆盖已有配置；已由 dpkg / RPM 管理的安装请继续使用对应包升级。
 
 ## 三条命令
 
@@ -104,6 +104,8 @@ campus-network --help
 | `/etc/campus-network/account.json` | 账号、密码、运营商；权限 0600 |
 | `/var/lib/campus-network/state.json` | 跨重启保存的模式和待处理会话；目录 0700 |
 | `/run/campus-network/control.sock` | 本机控制接口；socket 0666，目录由 root 持有 |
+
+如使用自定义 CA，通用安装器可通过 `CURL_CA_BUNDLE` 或 `SSL_CERT_FILE` 检查证书；还需由管理员在 systemd 服务中设置相同环境变量，并将证书放在服务可读的系统目录（例如 `/etc/ssl`）。默认安装直接使用 `ca-certificates` 提供的系统证书。
 
 默认配置见 [config/config.json](config/config.json)。单网卡可保持 `interface` 为空；多网卡、VPN 或多条默认路由时，建议明确填入校园网网卡，例如 `"interface": "enp1s0"`，避免通过其他出口误判在线。外网探测使用 HTTPS 并校验状态码 / 内容。
 
