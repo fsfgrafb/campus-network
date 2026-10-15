@@ -18,7 +18,7 @@ chmod 0755 "$stage" "$stage/cache"
 apt-get update
 apt-get -y --download-only --no-install-recommends \
     -o Dir::State::status=/dev/null -o Dir::Cache::archives="$stage/cache" \
-    install python3 curl systemd ca-certificates
+    install curl ca-certificates
 cp "$stage/cache/"*.deb "$stage/$name/packages/"
 cp "$package" "$stage/$name/packages/"
 apt-get -y --no-install-recommends install apt-utils

@@ -3,5 +3,6 @@
 *.changes
 build/
 dist/
+release/
 *.rpm
 __pycache__/

@@ -2,51 +2,29 @@
 
 苏州工学院锐捷 ePortal 校园网持续联网服务。Python 3 标准库管理状态，curl 执行校园网认证，systemd 负责开机启动、崩溃重启和卡死恢复。没有 pip 依赖。
 
-## 安装：Debian 离线服务器
+## 安装：只下载一个包
 
-先在服务器确认系统版本和架构：
+从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载唯一的安装包 **`campus-network_2.1.0_linux.tar.gz`**。无需选择 deb / rpm，也无需提前判断 Debian 版本或 CPU 架构。另一个 `SHA256SUMS` 文件仅用于手动校验。
 
-```bash
-. /etc/os-release; echo "Debian $VERSION_ID"; dpkg --print-architecture
-```
-
-从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载匹配的完整离线包。例如 Debian 12、amd64 对应 `campus-network_2.0.1_debian12_amd64_offline.tar.gz`。提供 Debian 12 / 13 × amd64 / arm64 四种组合，内含 Python、curl、systemd、HTTPS 所需的 CA 根证书及其发行版依赖。
-
-将压缩包传到服务器任意目录，在该目录执行一行：
+假设目标服务器已经有 **Python ≥ 3.9 和 systemd**。将安装包传到任意目录，执行一行：
 
 ```bash
-tar -xzf campus-network_2.0.1_debian12_amd64_offline.tar.gz && sudo sh campus-network_2.0.1_debian12_amd64_offline/install.sh
+tar -xzf campus-network_2.1.0_linux.tar.gz && sudo sh campus-network-2.1.0/install.sh
 ```
 
-安装器校验系统版本、CPU 架构和包校验和，建立临时本地 APT 仓库，再使用 `--no-download` 安装；整个过程无需外网。已满足要求的系统依赖会保留。仅安装需要 root；日常命令均无需 sudo。没有 sudo 的服务器可切换为 root 执行同一安装命令。
+安装器自动识别系统版本与 CPU，在 Debian 12 / 13 的 amd64 / arm64 上，从包内对应的本地仓库补齐 curl、CA 根证书及所需依赖，全程无需外网。系统已有且满足要求的依赖会保留，不安装其他系统或架构的依赖，也不捆绑、替换 Python。
 
-安装后默认**不联网**，不会主动占用校园网账号。首次启用：
+安装包会同时携带四种环境的依赖，因此下载体积大一些。安装只使用当前机器对应的部分，APT 按实际需要安装，重复执行也可以。安装和升级需要管理员权限；日常命令全部无需 sudo。
+
+其他使用 systemd 的 Linux 可以使用同一包，但需要预装 curl 和有效的系统 CA 证书。安装器选择原生 deb / rpm 或通用安装方式；不支持 Windows、macOS、OpenWrt 或没有 systemd 的系统。
+
+安装后默认**不联网**，不会主动占用校园网账号。首次执行：
 
 ```bash
 campus-network on
 ```
 
-按提示输入账号、密码、运营商，之后只需执行 `on`。密码不会回显，不需要写进命令行或 shell 历史。
-
-### 其他安装包
-
-| 文件 | 用途 |
-| --- | --- |
-| `campus-network_2.0.1_all.deb` | 已有依赖的 Debian / Ubuntu；不区分 CPU 架构 |
-| `campus-network-2.0.1-1.noarch.rpm` | 已有依赖的 RPM 系 Linux；不区分 CPU 架构 |
-| `campus-network_2.0.1_linux-any.tar.gz` | 其他使用 systemd 的 Linux；内含通用安装脚本 |
-| `*_debian12_*_offline.tar.gz` / `*_debian13_*_offline.tar.gz` | 指定发行版和 CPU 的完整离线依赖包 |
-| `SHA256SUMS` | 所有发布文件的 SHA-256 校验和 |
-
-轻量包仅依赖 **Python ≥ 3.9、curl、systemd、ca-certificates**。它们是解释执行程序，没有必要为每种 CPU 重复打包；amd64、arm64 及发行版提供上述依赖的其他架构使用同一份程序。不支持 Windows、macOS、OpenWrt 或没有 systemd 的容器运行环境。
-
-依赖已安装时，Debian 一行离线安装：
-
-```bash
-sudo dpkg -i ./campus-network_2.0.1_all.deb
-```
-
-RPM：`sudo rpm -Uvh ./campus-network-2.0.1-1.noarch.rpm`。通用包：解压后执行 `sudo sh ./install.sh`。HTTPS 外网探测必须有有效的 CA 根证书。通用安装器会检查依赖和证书，不会自动联网下载，也不会覆盖已有配置；已由 dpkg / RPM 管理的安装请继续使用对应包升级。
+按提示输入账号、密码、运营商，之后自动复用。升级保留配置和联网意愿。密码不会回显，不需要写入命令行或 shell 历史。
 
 ## 三条命令
 
@@ -138,20 +116,24 @@ sudo journalctl -u campus-network -f
 
 ## 构建与验证
 
-Linux 构建依赖为 Python 3、`dpkg-deb`、`rpmbuild`；不是运行时依赖：
+运行测试：
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 tools/build.py                     # dist/ 下生成 deb、rpm、通用 tar 和校验和
-python3 tools/build.py --format deb        # 也支持 rpm / tar
 ```
 
-制作与当前 Debian 容器发行版 / 架构匹配的完整离线包：
+CI 内部仍构建 deb、rpm 和各平台依赖仓库，用于测试与组装；**Release 仅发布一个统一安装包及其校验和**。不再把内部中间产物作为下载选项。
+
+本地准备原生包需 Python 3、`dpkg-deb`、`rpmbuild`：
 
 ```bash
-docker run --rm -v "$PWD:/work" -w /work debian:12-slim sh tools/offline-bundle.sh
+python3 tools/build.py
 ```
 
-脚本从官方 APT 源下载完整依赖闭包并生成本地索引；构建时需要联网，目标服务器安装时不需要。其他架构可在对应 Debian 原生机器 / 容器中运行相同脚本。
+在对应 Debian 12 / 13、amd64 / arm64 容器中运行 `sh tools/offline-bundle.sh` 准备 curl / CA 依赖仓库，不下载 Python 或 systemd。收集四个仓库到 `dist/` 后执行：
 
-GitHub Actions 在 Python 3.9 / 3.11 / 3.13、amd64 / arm64 上运行测试，验证真实 systemd 服务启动、普通用户 / nobody 控制、模式跨重启保存、崩溃与 watchdog 恢复、Debian 12 / 13 包安装和 Fedora RPM 安装。发布标签必须与 `VERSION` 和程序版本一致；只有全部验证通过，才上传安装包。完整离线包在 `docker --network none` 的干净 Debian 镜像里实际安装，验证未预装 Python / curl 时也能离线使用。
+```bash
+python3 tools/universal.py       # release/ 下生成统一安装包和 SHA256SUMS
+```
+
+GitHub Actions 验证 Python 3.9 / 3.11 / 3.13、amd64 / arm64、真实 systemd 普通用户控制、崩溃与 watchdog 恢复、Debian / Fedora 原生包安装。统一安装包还在四种 Debian 环境中以 `--network none` 实际运行，验证自动选择依赖、HTTPS CA 证书、重复安装和服务启用。全部通过后才发布。

@@ -37,7 +37,7 @@ jobs:
         run: |
           test "$(python src/campus-network --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" = "$(cat VERSION)"
           python -m json.tool config/config.json >/dev/null
-          for script in install.sh tools/offline-bundle.sh debian/postinst debian/prerm debian/postrm; do sh -n "$script"; done
+          for script in install.sh tools/install-universal.sh tools/offline-bundle.sh debian/postinst debian/prerm debian/postrm; do sh -n "$script"; done
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then test "$GITHUB_REF_NAME" = "v$(cat VERSION)"; fi
 
   package:
@@ -197,9 +197,13 @@ jobs:
           path: dist
       - name: Download complete Debian dependency closure
         run: docker run --rm -e DEBIAN_FRONTEND=noninteractive -v "$PWD:/work" -w /work debian:${{ matrix.version }}-slim sh tools/offline-bundle.sh
-      - name: Install without network, Python or curl preinstalled
+      - name: Prepare system with Python and systemd
         run: |
-          docker run --rm --network none -e DEBIAN_FRONTEND=noninteractive -v "$PWD/dist:/artifacts:ro" debian:${{ matrix.version }}-slim sh -ec '
+          printf 'FROM debian:${{ matrix.version }}-slim\nRUN apt-get update && apt-get install -y --no-install-recommends python3 systemd\n' > /tmp/Dockerfile.campus
+          docker build -t campus-target -f /tmp/Dockerfile.campus /tmp
+      - name: Install without network or curl preinstalled
+        run: |
+          docker run --rm --network none -e DEBIAN_FRONTEND=noninteractive -v "$PWD/dist:/artifacts:ro" campus-target sh -ec '
             mkdir /tmp/offline
             tar -xzf /artifacts/*_debian${{ matrix.version }}_${{ matrix.arch }}_offline.tar.gz -C /tmp/offline
             sh /tmp/offline/campus-network_*/install.sh
@@ -215,23 +219,69 @@ jobs:
           path: dist/*_offline.tar.gz
           if-no-files-found: error
 
+  universal:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [package, offline]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: python3 tools/universal.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: universal
+          path: release/*
+
+  universal-install:
+    needs: universal
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        version: ['12', '13']
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: universal
+          path: release
+      - name: Prepare Python host
+        run: |
+          printf 'FROM debian:${{ matrix.version }}-slim\nRUN apt-get update && apt-get install -y --no-install-recommends python3 systemd\n' > /tmp/Dockerfile.campus
+          docker build -t campus-target -f /tmp/Dockerfile.campus /tmp
+      - name: One installer selects native dependencies while offline
+        run: |
+          docker run --rm --network none -e DEBIAN_FRONTEND=noninteractive -v "$PWD/release:/artifacts:ro" campus-target sh -ec '
+            mkdir /tmp/campus
+            tar -xzf /artifacts/campus-network_*_linux.tar.gz -C /tmp/campus
+            sh /tmp/campus/campus-network-*/install.sh
+            campus-network --version
+            python3 -c "import ssl; assert ssl.create_default_context().get_ca_certs()"
+            systemctl is-enabled campus-network.service
+            sh /tmp/campus/campus-network-*/install.sh
+          '
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, package, install, debian, rpm, offline]
+    needs: [test, package, install, debian, rpm, universal-install]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
+          name: universal
           path: dist
-          merge-multiple: true
       - name: Publish verified packages
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           cd dist
-          rm -f SHA256SUMS
-          sha256sum ./*.deb ./*.rpm ./*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
           gh release create "$GITHUB_REF_NAME" ./* --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
