@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent ePortal manager; public commands: on, off, status."""
+"""Persistent ePortal manager; one shared account, controlled over a local socket."""
 
 import argparse
 import ast
@@ -22,7 +22,7 @@ import threading
 import time
 from urllib.parse import quote, urlencode, urlsplit
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 CONFIG_DIR = Path("/etc/campus-network")
 STATE_DIR = Path("/var/lib/campus-network")
 RUNTIME_DIR = Path("/run/campus-network")
@@ -144,7 +144,7 @@ def migrate_legacy(account_path, state_dir):
                 old.chmod(0o600)
                 logging.info("已迁移旧账号配置")
             except (ValueError, SyntaxError):
-                logging.warning("旧账号配置无法自动迁移；首次 on 时重新配置")
+                logging.warning("旧账号配置无法自动迁移；请执行 campus-network config")
     old_index = state_dir / "userindex"
     if not (state_dir / "state.json").exists() and old_index.exists():
         atomic_json(state_dir / "state.json", {
@@ -311,15 +311,20 @@ class Controller:
 
     def command(self, request):
         action = request.get("command")
-        if action not in ("on", "off", "status"):
-            raise ValueError("仅支持 on、off、status")
+        if action not in ("on", "off", "status", "config"):
+            raise ValueError("仅支持 on、off、status、config")
         with self.lock:
+            if action == "config":
+                account = valid_account(request.get("account"))
+                if self.state["mode"] != "off" or self.state["session"] or self.state.get("uncertain"):
+                    raise ValueError("旧会话尚未释放或联网已重新启用，保留原账号；请稍后重试 config")
+                atomic_json(self.account_path, account)
+                self._report("idle", "账号已保存；执行 campus-network on 开始联网")
+                return self.snapshot()
             if action != "status":
                 if action == "on":
                     if "account" in request:
-                        if self.state["mode"] == "on" or self.state["session"] or self.state.get("uncertain"):
-                            raise ValueError("请先 off 并确认会话已释放，再更换账号")
-                        atomic_json(self.account_path, valid_account(request["account"]))
+                        raise ValueError("请使用 campus-network config 配置账号")
                     if not self._account():
                         return {"needs_account": True}
                 if self.state["mode"] != action:
@@ -359,7 +364,7 @@ class Controller:
                 return
             account = self._account() if mode == "on" else None
             if mode == "on" and not account:
-                self._report("config-error", "账号未配置，请执行 campus-network on")
+                self._report("config-error", "账号未配置，请执行 campus-network config")
                 return
         try:
             if mode == "off":
@@ -458,7 +463,9 @@ def daemon():
             self.request.settimeout(2)
             try:
                 result = control.command(read_message(self.rfile))
-            except (OSError, ValueError, TypeError, KeyError):
+            except ValueError as exc:
+                result = {"error": str(exc)}
+            except (OSError, TypeError, KeyError):
                 result = {"error": "请求无效或配置不可读，请检查服务日志与账号配置"}
             try:
                 self.wfile.write((json.dumps(result, ensure_ascii=False) + "\n").encode())
@@ -533,9 +540,30 @@ def print_status(value):
     print("状态更新：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["changed_at"])))
 
 
+def configure():
+    current = client({"command": "status"})
+    if not sys.stdin.isatty():
+        raise ValueError("请在交互终端执行 campus-network config 配置账号")
+    if current.get("username"):
+        print("当前账号：%s @ %s" % (current["username"], current["service"]))
+    username = input("校园网账号：").strip()
+    password = getpass.getpass("校园网密码：")
+    choice = input("运营商 [1 移动 / 2 电信 / 3 联通 / 4 校园网]：").strip()
+    service = SERVICES[int(choice) - 1] if choice in ("1", "2", "3", "4") else choice
+    account = valid_account({"username": username, "password": password, "service": service})
+    status = client({"command": "off"})
+    deadline = time.monotonic() + 15
+    while status.get("pending_release"):
+        if status.get("state") == "release-unconfirmed" or time.monotonic() >= deadline:
+            raise ValueError("旧会话尚未确认释放，原账号已保留且自动登录已关闭；稍后再次执行 config")
+        time.sleep(.2)
+        status = client({"command": "status"})
+    return client({"command": "config", "account": account})
+
+
 def main():
-    parser = argparse.ArgumentParser(description="校园网持续联网管理；on/off/status 均无需 sudo")
-    parser.add_argument("command", nargs="?", choices=("on", "off", "status"), default="status")
+    parser = argparse.ArgumentParser(description="校园网管理；on/off/status/config 均无需 sudo")
+    parser.add_argument("command", nargs="?", choices=("on", "off", "status", "config"), default="status")
     parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--json", action="store_true", help="输出 JSON 状态")
     parser.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
@@ -545,16 +573,11 @@ def main():
         if args.daemon:
             daemon()
             return 0
-        result = client({"command": args.command})
+        if args.command == "config" and args.json:
+            raise ValueError("config 需要交互输入，不支持 --json")
+        result = configure() if args.command == "config" else client({"command": args.command})
         if result.get("needs_account"):
-            if not sys.stdin.isatty() or args.json:
-                raise ValueError("尚未配置账号，请在终端执行 campus-network on 完成首次配置")
-            username = input("校园网账号：").strip()
-            password = getpass.getpass("校园网密码：")
-            choice = input("运营商 [1 移动 / 2 电信 / 3 联通 / 4 校园网]：").strip()
-            service = SERVICES[int(choice) - 1] if choice in ("1", "2", "3", "4") else choice
-            account = valid_account({"username": username, "password": password, "service": service})
-            result = client({"command": "on", "account": account})
+            raise ValueError("尚未配置账号，请先执行 campus-network config")
         if args.json:
             print(json.dumps(result, ensure_ascii=False))
         else:

@@ -56,4 +56,4 @@ done
 systemctl daemon-reload
 systemctl enable campus-network.service
 systemctl restart campus-network.service
-echo '安装完成。普通用户运行 campus-network on 首次配置；campus-network status 查看状态。'
+echo '安装完成。运行 campus-network config 配置账号，再运行 campus-network on 联网；均无需 sudo。'

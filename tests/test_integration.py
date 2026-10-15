@@ -122,7 +122,8 @@ class ControllerTests(unittest.TestCase):
         }
 
     def turn_on(self, controller):
-        return controller.command({"command": "on", "account": dict(self.account)})
+        controller.command({"command": "config", "account": dict(self.account)})
+        return controller.command({"command": "on"})
 
     def connect(self, controller):
         self.turn_on(controller)
@@ -137,6 +138,52 @@ class ControllerTests(unittest.TestCase):
             controller.step()
         self.assertEqual(controller.state["mode"], "off")
         self.assertEqual(self.portal.count("login"), 0)
+
+    def test_config_saves_one_account_without_enabling_network(self):
+        controller = self.controller()
+        result = controller.command({"command": "config", "account": self.account})
+        self.assertEqual(result["mode"], "off")
+        self.assertEqual(result["username"], self.account["username"])
+        self.assertEqual(campus_network.read_json(self.account_path), self.account)
+        controller.step()
+        self.assertEqual(self.portal.count("login"), 0)
+
+    def test_config_replaces_account_only_after_old_session_is_released(self):
+        controller = self.controller()
+        self.connect(controller)
+        replacement = dict(self.account, username="new-account", password="new-password")
+        controller.command({"command": "off"})
+        with self.assertRaises(ValueError):
+            controller.command({"command": "config", "account": replacement})
+        self.assertEqual(campus_network.read_json(self.account_path), self.account)
+        controller.step()
+        result = controller.command({"command": "config", "account": replacement})
+        self.assertEqual(result["mode"], "off")
+        self.assertEqual(campus_network.read_json(self.account_path), replacement)
+        controller.command({"command": "on"})
+        self.portal.probe_result = {"kind": "portal", "query": "new-query"}
+        controller.step()
+        self.assertEqual([call[1] for call in self.portal.calls if call[0] == "login"][-1], replacement)
+
+    def test_config_cannot_overwrite_account_if_network_was_reenabled(self):
+        controller = self.controller()
+        self.turn_on(controller)
+        with self.assertRaises(ValueError):
+            controller.command({"command": "config", "account": dict(self.account, username="new")})
+        self.assertEqual(campus_network.read_json(self.account_path), self.account)
+        self.assertEqual(controller.state["mode"], "on")
+
+    def test_invalid_config_preserves_existing_account(self):
+        controller = self.controller()
+        controller.command({"command": "config", "account": self.account})
+        with self.assertRaises(ValueError):
+            controller.command({"command": "config", "account": dict(self.account, password="")})
+        self.assertEqual(campus_network.read_json(self.account_path), self.account)
+
+    def test_on_without_account_requests_config_and_stays_off(self):
+        controller = self.controller()
+        self.assertTrue(controller.command({"command": "on"})["needs_account"])
+        self.assertEqual(controller.state["mode"], "off")
 
     def test_cable_removed_during_probe_prevents_login_with_stale_parameters(self):
         controller = self.controller()
@@ -497,7 +544,7 @@ class ControllerTests(unittest.TestCase):
         controller.step()
         controller.command({"command": "off"})
         with self.assertRaises(ValueError):
-            controller.command({"command": "on", "account": dict(self.account, username="replacement")})
+            controller.command({"command": "config", "account": dict(self.account, username="replacement")})
 
 
 class ValidationTests(unittest.TestCase):
@@ -614,6 +661,61 @@ eth-fast 00000000 0100000A 0003 0 0 10 00000000 0 0 0
         self.assertFalse(self.inspect("eth-fast", routes="Iface Destination Gateway Flags RefCnt Use Metric Mask\n")["ready"])
 
 
+class ConfigCLITests(unittest.TestCase):
+    def configure(self, replies, service="1", password="new-password"):
+        with patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", side_effect=["new-account", service]), \
+                patch.object(campus_network.getpass, "getpass", return_value=password), \
+                patch.object(campus_network, "client", side_effect=replies) as client, \
+                patch.object(campus_network.time, "sleep"):
+            result = campus_network.configure()
+        return result, client
+
+    def test_config_first_setup_saves_without_turning_on(self):
+        result, client = self.configure([{}, {"pending_release": False}, {"mode": "off"}])
+        self.assertEqual(result["mode"], "off")
+        self.assertEqual([call.args[0]["command"] for call in client.call_args_list], ["status", "off", "config"])
+        self.assertEqual(client.call_args.args[0]["account"]["service"], "移动")
+
+    def test_config_waits_for_release_before_sending_new_credentials(self):
+        _, client = self.configure([{}, {"pending_release": True, "state": "releasing"},
+                                    {"pending_release": False}, {"mode": "off"}])
+        self.assertEqual([call.args[0]["command"] for call in client.call_args_list], ["status", "off", "status", "config"])
+
+    def test_unconfirmed_old_session_does_not_send_new_credentials(self):
+        with patch.object(campus_network, "client", side_effect=[{}, {"pending_release": True, "state": "release-unconfirmed"}]) as client:
+            with patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
+                    patch("builtins.input", side_effect=["new-account", "1"]), \
+                    patch.object(campus_network.getpass, "getpass", return_value="new-password"):
+                with self.assertRaises(ValueError):
+                    campus_network.configure()
+        self.assertEqual([call.args[0]["command"] for call in client.call_args_list], ["status", "off"])
+
+    def test_cancelled_input_does_not_disable_existing_connection(self):
+        with patch.object(campus_network, "client", return_value={}) as client, \
+                patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                campus_network.configure()
+        client.assert_called_once_with({"command": "status"})
+
+    def test_invalid_input_does_not_disable_existing_connection(self):
+        with patch.object(campus_network, "client", return_value={}) as client, \
+                patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", side_effect=["new-account", "9"]), \
+                patch.object(campus_network.getpass, "getpass", return_value="password"):
+            with self.assertRaises(ValueError):
+                campus_network.configure()
+        client.assert_called_once_with({"command": "status"})
+
+    def test_on_without_account_tells_user_to_run_config(self):
+        with patch.object(sys, "argv", ["campus-network", "on"]), \
+                patch.object(campus_network, "client", return_value={"needs_account": True}), \
+                patch.object(sys, "stderr", new_callable=io.StringIO) as error:
+            self.assertEqual(campus_network.main(), 1)
+        self.assertIn("campus-network config", error.getvalue())
+
+
 class MessageTests(unittest.TestCase):
     def test_json_object_with_newline_is_accepted(self):
         self.assertEqual(campus_network.read_message(io.BytesIO(b'{"command":"status"}\n')), {"command": "status"})
@@ -700,7 +802,8 @@ class DaemonSocketTests(unittest.TestCase):
 
     def test_control_socket_is_public_but_persistent_secrets_are_private(self):
         self.assertEqual(stat.S_IMODE((self.root / "run/control.sock").stat().st_mode), 0o666)
-        result = self.request({"command": "on", "account": ControllerTests.account})
+        self.request({"command": "config", "account": ControllerTests.account})
+        result = self.request({"command": "on"})
         self.assertEqual(result["mode"], "on")
         self.assertNotIn(ControllerTests.account["password"], json.dumps(result))
         for path in (self.root / "etc/account.json", self.root / "state/state.json"):
@@ -715,7 +818,8 @@ class DaemonSocketTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1)
 
     def test_restart_retains_on_and_off_modes(self):
-        self.request({"command": "on", "account": ControllerTests.account})
+        self.request({"command": "config", "account": ControllerTests.account})
+        self.request({"command": "on"})
         self.stop()
         self.start()
         self.assertEqual(self.request({"command": "status"})["mode"], "on")

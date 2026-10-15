@@ -4,12 +4,12 @@
 
 ## 安装：只下载一个包
 
-从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载唯一的安装包 **`campus-network_2.1.0_linux.tar.gz`**。无需选择 deb / rpm，也无需提前判断 Debian 版本或 CPU 架构。另一个 `SHA256SUMS` 文件仅用于手动校验。
+从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载唯一的安装包 **`campus-network_2.2.0_linux.tar.gz`**。无需选择 deb / rpm，也无需提前判断 Debian 版本或 CPU 架构。另一个 `SHA256SUMS` 文件仅用于手动校验。
 
 假设目标服务器已经有 **Python ≥ 3.9 和 systemd**。将安装包传到任意目录，执行一行：
 
 ```bash
-tar -xzf campus-network_2.1.0_linux.tar.gz && sudo sh campus-network-2.1.0/install.sh
+tar -xzf campus-network_2.2.0_linux.tar.gz && sudo sh campus-network-2.2.0/install.sh
 ```
 
 安装器自动识别系统版本与 CPU，在 Debian 12 / 13 的 amd64 / arm64 上，从包内对应的本地仓库补齐 curl、CA 根证书及所需依赖，全程无需外网。系统已有且满足要求的依赖会保留，不安装其他系统或架构的依赖，也不捆绑、替换 Python。
@@ -21,20 +21,22 @@ tar -xzf campus-network_2.1.0_linux.tar.gz && sudo sh campus-network-2.1.0/insta
 安装后默认**不联网**，不会主动占用校园网账号。首次执行：
 
 ```bash
-campus-network on
+campus-network config   # 输入账号、密码、运营商
+campus-network on       # 开始持续联网
 ```
 
 按提示输入账号、密码、运营商，之后自动复用。升级保留配置和联网意愿。密码不会回显，不需要写入命令行或 shell 历史。
 
-## 三条命令
+## 四条命令
 
 ```bash
-campus-network on       # 持久化开启持续联网，首次使用时交互配置账号
+campus-network config   # 设置或更换唯一的校园网账号
+campus-network on       # 持久化开启持续联网
 campus-network off      # 先持久化禁止登录，再尝试释放已有会话
 campus-network status   # 查看目标模式、实际状态、原因、时间和下次尝试
 ```
 
-所有能登录服务器的本机用户都可以使用这三条命令，无需加入用户组，也无需 sudo。它们通过 Unix socket 控制唯一的服务进程；账号文件仍仅 root 可读。这个权限模型适用于本机用户均为可信内部人员的服务器。
+所有能登录服务器的本机用户都可以使用这四条命令，无需加入用户组，也无需 sudo。它们通过 Unix socket 控制唯一的服务进程；账号文件仍仅 root 可读。这个权限模型适用于本机用户均为可信内部人员的服务器。
 
 ```bash
 watch -c -n 1 campus-network status # 实时查看；直接运行 status 时终端状态带颜色
@@ -93,13 +95,13 @@ campus-network --help
 sudo systemctl restart campus-network
 ```
 
-更换账号：先执行 `campus-network off` 并等到会话释放，再由管理员删除 `/etc/campus-network/account.json`，执行 `campus-network on` 重新配置。普通用户可以控制联网，但不能读取保存的密码。
+设置和更换账号都执行 `campus-network config`，无需 sudo。当前只保存一份全局账号，没有多账号或用户配置档案。输入并校验新信息后，命令先持久化关闭自动登录、等待旧会话释放，再替换账号；配置成功后保持 off，执行 `campus-network on` 才开始联网。若旧会话暂时无法释放，会保留原账号并给出提示，稍后再次执行 config 即可。输入期间取消不会修改原配置。密码不回显，状态和日志不返回密码。
 
 ### 从 1.x 升级
 
 安装包会修复旧版目录 / 账号文件的宽松权限，并迁移旧 `/etc/campus-network/account` 中的账号及 `/var/lib/campus-network/userindex` 会话；新 JSON 尚未自定义时，也会迁移旧门户和探测地址。旧版没有持久模式，首次迁移默认为 **off**，并尝试释放遗留会话；请确认后执行 `campus-network on`。已经由 2.x 保存的模式、账号和会话在升级时保留。
 
-旧的 `login/logout/relogin/keep` 命令由三条新命令替代；自动重连已内置在 `on`。旧配置文件暂保留供核对。
+旧的 `login/logout/relogin/keep` 命令由新命令替代；自动重连已内置在 `on`。旧配置文件暂保留供核对。
 
 ## 运维
 
