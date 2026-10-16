@@ -25,7 +25,7 @@ import time
 import uuid
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 CONFIG_DIR = Path("/etc/campus-network")
 STATE_DIR = Path("/var/lib/campus-network")
 RUNTIME_DIR = Path("/run/campus-network")
@@ -1061,7 +1061,78 @@ def prompt_ip():
                      "namespace": input("已有网络命名空间（可留空）：").strip()})
 
 
-def select_menu(title, rows, selected=0):
+class MenuTerminal:
+    """Keep terminal mode and queued input intact while navigating menu pages."""
+    def __init__(self):
+        self.window = None
+
+    def open(self):
+        import curses
+        if self.window is None:
+            self.window = curses.initscr()
+            curses.noecho()
+            curses.cbreak()
+            self.window.keypad(False)
+        return self.window
+
+    def prompt(self, callback, *args):
+        if self.window is None:
+            return callback(*args)
+        import curses
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            return callback(*args)
+        finally:
+            curses.reset_prog_mode()
+            self.window.keypad(False)
+            self.window.clearok(True)
+
+    def close(self):
+        if self.window is None:
+            return
+        import curses
+        for restore in (curses.flushinp, lambda: self.window.keypad(False),
+                        curses.echo, curses.nocbreak, curses.endwin):
+            try:
+                restore()
+            except curses.error:
+                pass
+        self.window = None
+
+
+def read_menu_key(window):
+    """Decode both CSI and SS3 arrows without mistaking their ESC for Back."""
+    import curses
+    key = window.getch()
+    if key != 27:
+        return key
+    window.timeout(250)
+    try:
+        prefix = window.getch()
+        if prefix == -1:
+            return 27
+        if prefix not in (ord("["), ord("O")):
+            # ESC followed by another key: return Back, keep that key for the
+            # next page (including the ESC which begins a following arrow).
+            curses.ungetch(prefix)
+            return 27
+        for _ in range(32):
+            final = window.getch()
+            if final == -1:
+                return -1
+            if final == 27:
+                curses.ungetch(final)
+                return -1
+            if 0x40 <= final <= 0x7e:
+                return {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN,
+                        ord("C"): curses.KEY_RIGHT, ord("D"): curses.KEY_LEFT}.get(final, -1)
+        return -1
+    finally:
+        window.timeout(-1)
+
+
+def select_menu(title, rows, selected=0, terminal=None):
     import curses
     def screen(window):
         nonlocal selected
@@ -1069,7 +1140,9 @@ def select_menu(title, rows, selected=0):
             curses.curs_set(0)
         except curses.error:
             pass
-        window.keypad(True)
+        # Parse both normal and application cursor sequences ourselves; terminal
+        # emulators may send either, especially immediately after an Escape.
+        window.keypad(False)
         while True:
             height, width = window.getmaxyx()
             window.erase()
@@ -1084,7 +1157,7 @@ def select_menu(title, rows, selected=0):
                 except curses.error:
                     pass
             window.refresh()
-            key = window.getch()
+            key = read_menu_key(window)
             if key == curses.KEY_UP:
                 selected = (selected - 1) % len(rows)
             elif key == curses.KEY_DOWN:
@@ -1093,10 +1166,10 @@ def select_menu(title, rows, selected=0):
                 return selected, "back"
             elif key in (10, 13, curses.KEY_ENTER, curses.KEY_LEFT, curses.KEY_RIGHT):
                 return selected, "disable" if key == curses.KEY_LEFT else "enable" if key == curses.KEY_RIGHT else "enter"
-    return curses.wrapper(screen)
+    return screen(terminal.open()) if terminal is not None else curses.wrapper(screen)
 
 
-def configure():
+def configure_menu(terminal):
     if not sys.stdin.isatty():
         raise ValueError("请在交互终端执行 campus-network config；自动化配置可使用 pool 从标准输入读取 JSON")
     page, selected = "home", 0
@@ -1111,7 +1184,7 @@ def configure():
                 extra = item["state"] if page == "ips" else "冷却 %ds" % item["cooldown_in"] if item["cooldown_in"] else "可用"
                 rows.append("[%s]%s %s — %s" % ("启用" if item["enabled"] else "禁用", " 主" if item["primary"] else "", label, extra))
             rows.append("＋ 新建 IP" if page == "ips" else "＋ 新建账号")
-        selected, key = select_menu("campus-network " + VERSION, rows, selected)
+        selected, key = select_menu("campus-network " + VERSION, rows, selected, terminal=terminal)
         if key == "back" or (page == "home" and selected == 3 and key == "enter"):
             if page == "home":
                 return status
@@ -1123,26 +1196,33 @@ def configure():
             elif selected == 2:
                 result = client({"command": "on" if key == "enable" else "off" if key == "disable" else "off" if status["mode"] == "on" else "on"})
                 if result.get("needs_account"):
-                    input("请先在账号池添加或启用账号。按 Enter 返回…")
+                    terminal.prompt(input, "请先在账号池添加或启用账号。按 Enter 返回…")
             continue
         try:
             if selected == len(status[page]):
                 if key == "enter":
-                    client({"command": "pool-add", "kind": page, "value": prompt_ip() if page == "ips" else prompt_account()})
+                    client({"command": "pool-add", "kind": page, "value": terminal.prompt(prompt_ip if page == "ips" else prompt_account)})
             else:
                 item = status[page][selected]
                 request = {"kind": page, "id": item["id"]}
                 if key in ("enable", "disable"):
                     client(dict(request, command="pool-enable", enabled=key == "enable"))
                 else:
-                    detail, operation = select_menu("条目详情：%s；编辑前请先禁用并等待释放" % rows[selected], ["设为主 IP" if page == "ips" else "设为主账号", "编辑", "返回"])
+                    detail, operation = select_menu("条目详情：%s；编辑前请先禁用并等待释放" % rows[selected], ["设为主 IP" if page == "ips" else "设为主账号", "编辑", "返回"], terminal=terminal)
                     if operation == "enter" and detail == 0:
                         client(dict(request, command="pool-primary"))
                     elif operation == "enter" and detail == 1:
-                        client(dict(request, command="pool-edit", value=prompt_ip() if page == "ips" else prompt_account()))
+                        client(dict(request, command="pool-edit", value=terminal.prompt(prompt_ip if page == "ips" else prompt_account)))
         except ValueError as exc:
-            print("配置未保存：%s" % exc)
-            input("按 Enter 返回菜单…")
+            terminal.prompt(input, "配置未保存：%s\n按 Enter 返回菜单…" % exc)
+
+
+def configure():
+    terminal = MenuTerminal()
+    try:
+        return configure_menu(terminal)
+    finally:
+        terminal.close()
 
 
 def main():

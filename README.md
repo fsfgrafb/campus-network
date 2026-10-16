@@ -7,7 +7,7 @@
 从 [Releases](https://github.com/fsfgrafb/campus-network/releases/latest) 下载安装包，上传到服务器后执行：
 
 ```bash
-tar -xzf campus-network_3.0.1_linux.tar.gz && sudo sh campus-network-3.0.1/install.sh
+tar -xzf campus-network_3.0.2_linux.tar.gz && sudo sh campus-network-3.0.2/install.sh
 ```
 
 需要 Python ≥ 3.9、systemd、curl、CA 证书和 iproute2（RPM 系统为 iproute）。Debian 12/13 的 amd64/arm64 通用离线包可补齐网络依赖。
@@ -25,7 +25,7 @@ campus-network status   # 查看状态
 
 首次使用先 `config`，再 `on`。默认只有一个自动检测地址的主 IP；添加第一个账号后即可按单出口方式使用。只增加备用账号、无需增加 IP，就能在主账号冷却时接替主 IP。模式、分配、账号冷却跨重启保留。
 
-菜单中 ↑↓ 选择，← 禁用，→ 启用，Enter 查看条目操作或新建，Esc 返回。新建项在各池列表底部。进入菜单不会断网。编辑已有条目前，先禁用并等待其会话释放；其他条目继续运行。支持 UTF-8 终端和 Linux Python 自带的 curses。
+菜单中 ↑↓ 选择，← 禁用，→ 启用，Enter 查看条目操作或新建，Esc 返回上级；在主菜单按 Esc 或 q 退出配置。新建项在各池列表底部。进入菜单不会断网。编辑已有条目前，先禁用并等待其会话释放；其他条目继续运行。支持 UTF-8 终端和 Linux Python 自带的 curses。
 
 主 IP 优先使用主账号；不可用时使用其他账号。副 IP 优先使用其他账号，最后才使用空闲的主账号。没有空闲账号时，主 IP 可以收回副 IP 上已确认的本地会话。主账号冷却到期不会打断主 IP 上健康的备用会话。
 
