@@ -25,7 +25,7 @@ import time
 import uuid
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 CONFIG_DIR = Path("/etc/campus-network")
 STATE_DIR = Path("/var/lib/campus-network")
 RUNTIME_DIR = Path("/run/campus-network")
@@ -34,12 +34,16 @@ DEFAULT_CONFIG = {
     "portal": "http://10.28.200.56:8080", "test_url": "http://1.1.1.1", "interface": "",
     "probe_urls": [
         {"url": "https://www.baidu.com", "status": 200, "contains": "百度"},
-        {"url": "https://www.qq.com", "status": 200, "contains": "腾讯"},
+        {"url": "https://connectivitycheck.platform.hicloud.com/generate_204", "status": 204},
     ],
     "check_interval": 3, "connect_timeout": 2, "request_timeout": 5,
     "retry_base": 2, "retry_max": 120, "initial_jitter": 3,
     "cooldown": 43200, "displacement_confirm": 5,
 }
+LEGACY_PROBE_URLS = [
+    {"url": "https://www.baidu.com", "status": 200, "contains": "百度"},
+    {"url": "https://www.qq.com", "status": 200, "contains": "腾讯"},
+]
 
 
 def read_json(path, default=None):
@@ -68,6 +72,19 @@ def atomic_json(path, value):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def migrate_probe_config(path):
+    """Replace only the exact former defaults, preserving administrator choices."""
+    config = read_json(path, {})
+    if not isinstance(config, dict) or config.get("probe_urls") != LEGACY_PROBE_URLS:
+        return
+    backup = path.with_name(path.name + ".pre-3.0.1")
+    if not backup.exists():
+        atomic_json(backup, config)
+    config["probe_urls"] = DEFAULT_CONFIG["probe_urls"]
+    atomic_json(path, config)
+    logging.info("已修正旧版默认外网探测配置，原配置备份至 %s", backup)
 
 
 def load_config(path):
@@ -504,6 +521,12 @@ class PoolPortal:
             if result["kind"] == "portal":
                 expected = self.owner.readiness.get(self.slot_id, {}).get("source_address")
                 advertised = parse_qs(result.get("query", "")).get("wlanuserip", [])
+                try:
+                    advertised = [str(ipaddress.IPv4Address(value)) for value in advertised]
+                except ipaddress.AddressValueError:
+                    # ePortal also sends opaque/encoded values. Preserve the query
+                    # for the server to interpret; these are not plaintext IPs.
+                    advertised = []
                 if expected and advertised and advertised != [expected]:
                     result = {"kind": "unknown", "reason": "认证页的源 IP 与当前出口不符，拒绝使用错误的认证参数"}
             self.last_kind, self.last_check = result["kind"], self.owner.clock()
@@ -932,6 +955,7 @@ def daemon():
     lock = (RUNTIME_DIR / "daemon.lock").open("w")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     migrate_legacy(CONFIG_DIR / "account.json", STATE_DIR)
+    migrate_probe_config(CONFIG_DIR / "config.json")
     config = load_config(CONFIG_DIR / "config.json")
     control = PoolController(config, STATE_DIR, CONFIG_DIR / "account.json")
 

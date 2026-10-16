@@ -4,7 +4,7 @@
   "interface": "",
   "probe_urls": [
     {"url": "https://www.baidu.com", "status": 200, "contains": "百度"},
-    {"url": "https://www.qq.com", "status": 200, "contains": "腾讯"}
+    {"url": "https://connectivitycheck.platform.hicloud.com/generate_204", "status": 204}
   ],
   "check_interval": 3,
   "connect_timeout": 2,
