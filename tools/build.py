@@ -80,6 +80,7 @@ Requires: python3 >= 3.9
 Requires: /usr/bin/curl
 Requires: systemd
 Requires: ca-certificates
+Requires: iproute
 AutoReqProv: no
 
 %description

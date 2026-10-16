@@ -662,51 +662,47 @@ eth-fast 00000000 0100000A 0003 0 0 10 00000000 0 0 0
 
 
 class ConfigCLITests(unittest.TestCase):
-    def configure(self, replies, service="1", password="new-password"):
+    def run_menu(self, keys, status=None):
+        status = status or {"mode": "on", "ips": [], "accounts": []}
         with patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
-                patch("builtins.input", side_effect=["new-account", service]), \
-                patch.object(campus_network.getpass, "getpass", return_value=password), \
-                patch.object(campus_network, "client", side_effect=replies) as client, \
-                patch.object(campus_network.time, "sleep"):
+                patch.object(campus_network, "client", return_value=status) as client, \
+                patch.object(campus_network, "select_menu", side_effect=keys):
             result = campus_network.configure()
         return result, client
 
-    def test_config_first_setup_saves_without_turning_on(self):
-        result, client = self.configure([{}, {"pending_release": False}, {"mode": "off"}])
-        self.assertEqual(result["mode"], "off")
-        self.assertEqual([call.args[0]["command"] for call in client.call_args_list], ["status", "off", "config"])
-        self.assertEqual(client.call_args.args[0]["account"]["service"], "移动")
+    def test_opening_and_closing_config_keeps_existing_connections(self):
+        result, client = self.run_menu([(0, "back")])
+        self.assertEqual(result["mode"], "on")
+        client.assert_called_once_with({"command": "status"})
 
-    def test_config_waits_for_release_before_sending_new_credentials(self):
-        _, client = self.configure([{}, {"pending_release": True, "state": "releasing"},
-                                    {"pending_release": False}, {"mode": "off"}])
-        self.assertEqual([call.args[0]["command"] for call in client.call_args_list], ["status", "off", "status", "config"])
+    def test_new_account_adds_to_pool_without_turning_network_off(self):
+        with patch.object(campus_network, "prompt_account", return_value=ControllerTests.account):
+            _, client = self.run_menu([(1, "enter"), (0, "enter"), (0, "back"), (0, "back")])
+        mutations = [call.args[0] for call in client.call_args_list if call.args[0]["command"] != "status"]
+        self.assertEqual(mutations, [{"command": "pool-add", "kind": "accounts", "value": ControllerTests.account}])
 
-    def test_unconfirmed_old_session_does_not_send_new_credentials(self):
-        with patch.object(campus_network, "client", side_effect=[{}, {"pending_release": True, "state": "release-unconfirmed"}]) as client:
-            with patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
-                    patch("builtins.input", side_effect=["new-account", "1"]), \
-                    patch.object(campus_network.getpass, "getpass", return_value="new-password"):
-                with self.assertRaises(ValueError):
-                    campus_network.configure()
-        self.assertEqual([call.args[0]["command"] for call in client.call_args_list], ["status", "off"])
+    def test_arrows_set_enable_state_idempotently(self):
+        item = dict(id="a", username="example", service="移动", enabled=True, primary=True, cooldown_in=123)
+        _, client = self.run_menu([(1, "enter"), (0, "disable"), (0, "enable"), (0, "back"), (0, "back")],
+                                  {"mode": "on", "ips": [], "accounts": [item]})
+        mutations = [call.args[0] for call in client.call_args_list if call.args[0]["command"] != "status"]
+        self.assertEqual([value["enabled"] for value in mutations], [False, True])
+        self.assertTrue(all(value["command"] == "pool-enable" for value in mutations))
 
-    def test_cancelled_input_does_not_disable_existing_connection(self):
-        with patch.object(campus_network, "client", return_value={}) as client, \
-                patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
-                patch("builtins.input", side_effect=KeyboardInterrupt):
+    def test_cancelled_new_account_does_not_mutate_pool(self):
+        with patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
+                patch.object(campus_network, "client", return_value={"mode": "on", "accounts": []}) as client, \
+                patch.object(campus_network, "select_menu", side_effect=[(1, "enter"), (0, "enter")]), \
+                patch.object(campus_network, "prompt_account", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 campus_network.configure()
-        client.assert_called_once_with({"command": "status"})
+        self.assertTrue(all(call.args[0] == {"command": "status"} for call in client.call_args_list))
 
-    def test_invalid_input_does_not_disable_existing_connection(self):
-        with patch.object(campus_network, "client", return_value={}) as client, \
-                patch.object(campus_network.sys.stdin, "isatty", return_value=True), \
-                patch("builtins.input", side_effect=["new-account", "9"]), \
+    def test_invalid_credentials_are_rejected_before_any_daemon_mutation(self):
+        with patch("builtins.input", side_effect=["example", "9"]), \
                 patch.object(campus_network.getpass, "getpass", return_value="password"):
             with self.assertRaises(ValueError):
-                campus_network.configure()
-        client.assert_called_once_with({"command": "status"})
+                campus_network.prompt_account()
 
     def test_on_without_account_tells_user_to_run_config(self):
         with patch.object(sys, "argv", ["campus-network", "on"]), \
@@ -806,7 +802,7 @@ class DaemonSocketTests(unittest.TestCase):
         result = self.request({"command": "on"})
         self.assertEqual(result["mode"], "on")
         self.assertNotIn(ControllerTests.account["password"], json.dumps(result))
-        for path in (self.root / "etc/account.json", self.root / "state/state.json"):
+        for path in (self.root / "state/pool.json",):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_idle_socket_client_cannot_block_status_or_off(self):

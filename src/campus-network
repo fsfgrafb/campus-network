@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Persistent ePortal manager; one shared account, controlled over a local socket."""
+"""Persistent ePortal account/IP allocator, controlled over a local socket."""
 
 import argparse
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import getpass
 import html
+import ipaddress
 import json
 import logging
 import math
@@ -20,9 +22,10 @@ import sys
 import tempfile
 import threading
 import time
-from urllib.parse import quote, urlencode, urlsplit
+import uuid
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-VERSION = "2.2.1"
+VERSION = "3.0.0"
 CONFIG_DIR = Path("/etc/campus-network")
 STATE_DIR = Path("/var/lib/campus-network")
 RUNTIME_DIR = Path("/run/campus-network")
@@ -35,6 +38,7 @@ DEFAULT_CONFIG = {
     ],
     "check_interval": 3, "connect_timeout": 2, "request_timeout": 5,
     "retry_base": 2, "retry_max": 120, "initial_jitter": 3,
+    "cooldown": 43200, "displacement_confirm": 5,
 }
 
 
@@ -68,7 +72,7 @@ def atomic_json(path, value):
 
 def load_config(path):
     config = dict(DEFAULT_CONFIG, **read_json(path, {}))
-    for key in ("check_interval", "connect_timeout", "request_timeout", "retry_base", "retry_max", "initial_jitter"):
+    for key in ("check_interval", "connect_timeout", "request_timeout", "retry_base", "retry_max", "initial_jitter", "cooldown", "displacement_confirm"):
         value = config[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < (0 if key == "initial_jitter" else .01):
             raise ValueError("配置 %s 必须是有效的时间间隔" % key)
@@ -167,6 +171,8 @@ class Portal:
                    "--max-filesize", "1048576", "--write-out", "\n%{http_code}"]
         if self.interface:
             command += ["--interface", self.interface]
+        if self.config.get("namespace"):
+            command = ["ip", "netns", "exec", self.config["namespace"]] + command
         for key, value in (headers or {}).items():
             command += ["-H", key + ": " + value]
         data = None
@@ -181,11 +187,14 @@ class Portal:
         return int(status), body
 
     def probe(self):
+        captive = None
         try:
             _, body = self.request(self.config["test_url"], timeout=min(3, self.config["request_timeout"]))
             match = re.search(r"index\.jsp\?([^'\"<>\s]+)", body)
             if match:
-                return {"kind": "portal", "query": html.unescape(match[1]), "reason": "需要进行校园网认证"}
+                captive = {"kind": "portal", "query": html.unescape(match[1]), "reason": "需要进行校园网认证"}
+                if not getattr(self, "verify_portal", False):
+                    return captive
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
         for probe in self.config["probe_urls"]:
@@ -197,7 +206,7 @@ class Portal:
                     return {"kind": "online", "reason": "外网连通性检查通过"}
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 pass
-        return {"kind": "unknown", "reason": "外网连通性检查未通过，等待网络或认证服务恢复"}
+        return captive or {"kind": "unknown", "reason": "外网连通性检查未通过，等待网络或认证服务恢复"}
 
     def login(self, account, query):
         portal = self.config["portal"].rstrip("/")
@@ -248,12 +257,13 @@ def inspect_network(interface=""):
         except OSError:
             pass
     ready = bool(interface and route and address and carrier != "0")
-    return {"ready": ready, "interface": interface, "link": carrier != "0",
+    return {"ready": ready, "interface": interface, "source_address": address, "link": carrier != "0",
             "signature": (interface, carrier, address, tuple(route[i] for i in (0, 1, 2, 3, 6, 7)) if route else ()),
             "reason": "网络链路未连接" if carrier == "0" else "等待网卡、IPv4 地址或默认路由就绪"}
 
 
 class Controller:
+    """Single-session I/O engine; PoolController owns allocation and cooldown policy."""
     def __init__(self, config, state_dir, account_path, portal=None, network=None, clock=time.monotonic, rng=random.uniform):
         self.config = dict(DEFAULT_CONFIG, **config)
         self.state_dir, self.account_path = Path(state_dir), Path(account_path)
@@ -347,6 +357,8 @@ class Controller:
         with self.lock:
             signature = network["signature"]
             if signature != self.last_network:
+                if hasattr(self.portal, "network_changed"):
+                    self.portal.network_changed()
                 self.last_network = signature
                 self.failures = 0
                 self.next_action = self.clock() + self.rng(0, self.config["initial_jitter"])
@@ -382,10 +394,11 @@ class Controller:
                 return
             self.portal.cancelled = lambda: self.state["generation"] != generation or not self.network()["ready"]
             result = self.portal.probe()
+            observed_network = self.network()
             with self.lock:
                 if self.state["generation"] != generation:
                     return
-                if self.network()["signature"] != signature:
+                if observed_network["signature"] != signature:
                     self.wake.set()
                     return
                 if result["kind"] == "online":
@@ -422,6 +435,470 @@ class Controller:
                     self._retry("releasing" if mode == "off" else "retrying", reason)
 
 
+def valid_ip(value):
+    """An entry describes an existing system address; it never provisions one."""
+    if not isinstance(value, dict):
+        raise ValueError("IP 配置必须是对象")
+    result = {key: value.get(key, "") for key in ("address", "interface", "namespace")}
+    if not isinstance(result["address"], str):
+        raise ValueError("源 IPv4 必须是字符串")
+    if result["address"]:
+        address = ipaddress.IPv4Address(result["address"])
+        if address.is_unspecified or address.is_multicast or int(address) == 0xffffffff:
+            raise ValueError("源 IPv4 必须是具体的单播地址")
+        result["address"] = str(address)
+    for key, maximum in (("interface", 15), ("namespace", 64)):
+        if not isinstance(result[key], str) or (result[key] and not re.fullmatch(r"[a-zA-Z0-9_.-]{1,%d}" % maximum, result[key])):
+            raise ValueError("无效的 " + key)
+    if result["namespace"] and not result["address"]:
+        raise ValueError("命名空间出口必须填写源 IPv4 地址")
+    return result
+
+
+def inspect_slot(entry, config):
+    if not entry["address"]:
+        return inspect_network(entry["interface"] or config["interface"])
+    prefix = ["ip", "netns", "exec", entry["namespace"]] if entry["namespace"] else []
+    def ip_json(*args):
+        output = subprocess.run(prefix + ["ip", "-j"] + list(args), check=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+        return json.loads(output.stdout)
+    try:
+        links = ip_json("address", "show")
+        link = next((item for item in links if any(addr.get("local") == entry["address"]
+                     for addr in item.get("addr_info", []))), None)
+        routes = ip_json("route", "get", "1.1.1.1", "from", entry["address"])
+        route = routes[0] if routes else {}
+        interface = (link or {}).get("ifname", "")
+        ready = bool(link and "UP" in link.get("flags", []) and link.get("operstate") != "DOWN"
+                     and route.get("dev") == interface and (not entry["interface"] or entry["interface"] == interface))
+        return {"ready": ready, "source_address": entry["address"], "link": bool(link and link.get("operstate") != "DOWN"),
+                "interface": entry["address"],
+                "signature": (entry["namespace"], interface, entry["address"], ready,
+                              tuple(route.get(k, "") for k in ("dev", "gateway", "src", "prefsrc", "table", "type"))),
+                "reason": "源地址、接口或源策略路由尚未就绪"}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"ready": False, "link": False, "interface": entry["address"],
+                "signature": (entry["namespace"], entry["address"], False), "reason": "等待出口地址、命名空间及 iproute2"}
+
+
+class PoolPortal:
+    """Gate the single-session engine's reauthentication after a confirmed loss."""
+    def __init__(self, owner, slot_id, portal):
+        object.__setattr__(self, "owner", owner)
+        object.__setattr__(self, "slot_id", slot_id)
+        object.__setattr__(self, "portal", portal)
+        portal.verify_portal = True
+        self.suspected = None
+        self.last_kind, self.last_check = "unknown", 0
+
+    def __setattr__(self, key, value):
+        if key in ("interface", "cancelled"):
+            setattr(self.portal, key, value)
+        else:
+            object.__setattr__(self, key, value)
+
+    def probe(self):
+        result = self.portal.probe()
+        with self.owner.lock:
+            if result["kind"] == "portal":
+                expected = self.owner.readiness.get(self.slot_id, {}).get("source_address")
+                advertised = parse_qs(result.get("query", "")).get("wlanuserip", [])
+                if expected and advertised and advertised != [expected]:
+                    result = {"kind": "unknown", "reason": "认证页的源 IP 与当前出口不符，拒绝使用错误的认证参数"}
+            self.last_kind, self.last_check = result["kind"], self.owner.clock()
+            binding = self.owner.data["bindings"].get(self.slot_id)
+            if not binding or binding.get("release") or self.owner.data["mode"] == "off":
+                return {"kind": "unknown", "reason": "出口已停止参与分配"}
+            if result["kind"] == "online":
+                self.suspected = None
+                # Never turn unknown/transport-interrupted authentication into an owned session.
+                engine = self.owner.engines[self.slot_id]
+                if engine.state["session"] and not engine.state.get("uncertain") and not binding.get("online"):
+                    binding["online"] = True
+                    self.owner._save()
+                if not binding.get("online"):
+                    result = dict(result, reason="外网可用，但无法确认当前认证账号；保留预留，不冒认会话")
+                return result
+            if result["kind"] != "portal":
+                self.suspected = None
+                return result
+            if binding.get("online"):
+                now = self.owner.clock()
+                if self.suspected is None:
+                    self.suspected = now
+                elif now - self.suspected >= self.owner.config["displacement_confirm"]:
+                    others = [self.owner.engines[key].portal for key, b in self.owner.data["bindings"].items()
+                              if key != self.slot_id and b.get("online") and not b.get("release")]
+                    # Correlated failures are ambiguous; wait for an independent healthy exit.
+                    if not others or any(p.last_kind == "online" and p.last_check > self.suspected and now - p.last_check < 20 for p in others):
+                        self.owner._displaced(self.slot_id)
+                return {"kind": "unknown", "reason": "疑似账号被占用，等待连续认证页及 HTTPS 失败确认"}
+            engine = self.owner.engines[self.slot_id]
+            if engine.state.get("uncertain"):
+                return {"kind": "unknown", "reason": "认证结果未知，保留账号占用以避免重复抢登；需人工确认"}
+            if engine.state["session"]:
+                return {"kind": "unknown", "reason": "已提交认证，等待外网验证；不会重复提交登录"}
+            return result
+
+    def login(self, account, query):
+        result = self.portal.login(account, query)
+        message = str(result.get("message", "")).lower()
+        account_error = any(word in message for word in ("密码", "不存在", "用户名错误", "限制", "欠费", "停机", "禁用", "运营商用户认证失败", "password", "restricted", "invalid user"))
+        if result.get("result") != "success" and account_error:
+            # Only definite account errors enter cooldown; server-busy errors back off.
+            with self.owner.lock:
+                binding = self.owner.data["bindings"].get(self.slot_id)
+                if binding:
+                    account = self.owner._find("accounts", binding["account"])
+                    account["cooldown_until"] = self.owner.wall() + self.owner.config["cooldown"]
+                    account["cooldown_reason"] = "认证被拒绝，请检查账号、密码或运营商限制"
+                    binding["release"] = True
+                    self.owner._save()
+        return result
+
+    def logout(self, session):
+        return self.portal.logout(session)
+
+    def network_changed(self):
+        self.suspected = None
+        self.last_kind, self.last_check = "unknown", 0
+
+
+class PoolController:
+    """One durable allocator, independent bounded I/O workers for each IP.
+
+    pool.json is the transaction boundary for credentials, reservations and cooldowns.
+    Session engines journal their own in-flight login before sending it. Reservations
+    are written first and deleted last, so interrupted transitions fail closed.
+    """
+    def __init__(self, config, state_dir, account_path, portal_factory=None, network=None,
+                 clock=time.monotonic, wall=time.time, rng=random.uniform):
+        self.config = dict(DEFAULT_CONFIG, **config)
+        self.root, self.account_path = Path(state_dir), Path(account_path)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / "pool.json"
+        self.lock, self.wake = threading.RLock(), threading.Event()
+        self.clock, self.wall, self.rng = clock, wall, rng
+        self.heartbeat = time.time()
+        self.portal_factory = portal_factory or Portal
+        self.network = network or (lambda item: inspect_slot(item, self.config))
+        self.engines, self.workers, self.worker_errors, self.readiness = {}, {}, {}, {}
+        if self.path.exists():
+            self.data = read_json(self.path)
+            self._validate()
+            if not self.data["accounts"] and self.account_path.exists():
+                self.data["accounts"] = [dict(valid_account(read_json(self.account_path)), id="primary", enabled=True, cooldown_until=0)]
+                self.data["primary_account"] = "primary"
+                self._save()
+        else:
+            old = read_json(self.root / "state.json", {"mode": "off", "session": "", "generation": 0})
+            if old.get("mode") not in ("on", "off") or not isinstance(old.get("session"), str):
+                raise ValueError("旧状态损坏，拒绝自动迁移")
+            account = read_json(self.account_path)
+            accounts = [dict(valid_account(account), id="primary", enabled=True, cooldown_until=0)] if account else []
+            if not accounts and (old["session"] or old.get("uncertain")):
+                raise ValueError("旧会话存在但账号不可读，请修复原账号后迁移")
+            self.data = {"schema": 1, "mode": old["mode"], "accounts": accounts,
+                         "ips": [dict(id="primary", enabled=True, address="", interface=self.config["interface"], namespace="")],
+                         "primary_account": "primary" if accounts else "", "primary_ip": "primary", "bindings": {}}
+            if old["session"] or old.get("uncertain"):
+                directory = self.root / "slots" / "primary"
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                atomic_json(directory / "state.json", old)
+                self.data["bindings"]["primary"] = {"account": "primary", "online": bool(old["session"]), "release": old["mode"] == "off"}
+            self._save()
+        for slot_id in self.data["bindings"]:
+            self._engine(slot_id)
+
+    def _validate(self):
+        data = self.data
+        if not isinstance(data, dict) or data.get("schema") != 1 or data.get("mode") not in ("on", "off"):
+            raise ValueError("账号池状态损坏，拒绝自动登录")
+        for kind, limit in (("accounts", 64), ("ips", 16)):
+            items = data.get(kind)
+            if not isinstance(items, list) or len(items) > limit:
+                raise ValueError("账号池或 IP 池损坏")
+            seen = set()
+            for item in items:
+                ident = item.get("id", "")
+                if not isinstance(ident, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", ident) or ident in seen:
+                    raise ValueError("池条目标识无效或重复")
+                seen.add(ident)
+                if type(item.get("enabled")) is not bool:
+                    raise ValueError("启用状态必须是布尔值")
+                if kind == "accounts":
+                    valid_account(item)
+                    cd = item.get("cooldown_until", 0)
+                    if isinstance(cd, bool) or not isinstance(cd, (int, float)) or not math.isfinite(cd) or cd < 0:
+                        raise ValueError("冷却时间损坏")
+                else:
+                    valid_ip(item)
+        if data.get("primary_ip") not in {item["id"] for item in data["ips"]}:
+            raise ValueError("缺少主 IP")
+        if data.get("primary_account") and data["primary_account"] not in {item["id"] for item in data["accounts"]}:
+            raise ValueError("主账号不存在")
+        identities = [a["username"] for a in data["accounts"]]
+        addresses = [(a["namespace"], a["address"]) for a in data["ips"]]
+        if len(set(identities)) != len(identities) or len(set(addresses)) != len(addresses):
+            raise ValueError("账号或出口地址重复")
+        bindings = data.get("bindings")
+        if not isinstance(bindings, dict):
+            raise ValueError("分配状态损坏")
+        used = set()
+        for slot_id, binding in bindings.items():
+            self._find("ips", slot_id)
+            self._find("accounts", binding["account"])
+            if binding["account"] in used:
+                raise ValueError("同一账号存在多个占用，拒绝自动登录")
+            used.add(binding["account"])
+
+    def _find(self, kind, ident):
+        for item in self.data[kind]:
+            if item["id"] == ident:
+                return item
+        raise ValueError("条目不存在")
+
+    def _save(self):
+        atomic_json(self.path, self.data)
+
+    def _engine(self, slot_id):
+        if slot_id not in self.engines:
+            item = self._find("ips", slot_id)
+            account = self._find("accounts", self.data["bindings"][slot_id]["account"])
+            directory = self.root / "slots" / slot_id
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            atomic_json(directory / "account.json", valid_account(account))
+            config = dict(self.config, namespace=item["namespace"], source_address=item["address"])
+            portal = PoolPortal(self, slot_id, self.portal_factory(config))
+            self.engines[slot_id] = Controller(config, directory, directory / "account.json", portal=portal,
+                                               network=lambda: self.network(item), clock=self.clock, rng=self.rng)
+            if self.data["bindings"][slot_id].get("displaced"):
+                engine = self.engines[slot_id]
+                engine._save(mode="off", session="", uncertain=False, generation=engine.state["generation"] + 1)
+        return self.engines[slot_id]
+
+    def _displaced(self, slot_id):
+        binding = self.data["bindings"][slot_id]
+        account = self._find("accounts", binding["account"])
+        account.update(cooldown_until=self.wall() + self.config["cooldown"], cooldown_reason="疑似账号在其他设备使用")
+        # Never send a stale logout or re-login after displacement: that can evict a student.
+        binding.update(release=True, displaced=True)
+        self._save()
+        engine = self.engines[slot_id]
+        engine.command({"command": "off"})
+        with engine.lock:
+            engine._save(session="", uncertain=False)
+        self.wake.set()
+
+    def snapshot(self):
+        with self.lock:
+            ips = []
+            for item in self.data["ips"]:
+                binding = self.data["bindings"].get(item["id"])
+                engine = self.engines.get(item["id"])
+                status = engine.snapshot() if engine else {"state": "disabled" if not item["enabled"] else "waiting-account", "reason": "等待可用账号"}
+                network = self.readiness.get(item["id"])
+                if not engine and item["enabled"] and network and not network["ready"]:
+                    status.update(state="waiting-network", reason=network["reason"])
+                if item["id"] in self.worker_errors:
+                    status.update(state="worker-error", reason="出口处理异常，请检查服务日志")
+                if status["state"] == "online" and binding and not binding.get("online"):
+                    status["state"] = "online-unowned"
+                ips.append(dict(item, primary=item["id"] == self.data["primary_ip"],
+                                ownership="verified" if binding and binding.get("online") else "unconfirmed" if binding else "none",
+                                account_id=binding["account"] if binding else "", **{k: status.get(k) for k in ("state", "reason", "pending_release", "retry_in")}))
+            accounts = [{k: item[k] for k in ("id", "username", "service", "enabled")} for item in self.data["accounts"]]
+            for public, item in zip(accounts, self.data["accounts"]):
+                public.update(primary=item["id"] == self.data["primary_account"],
+                              cooldown_in=max(0, math.ceil(item.get("cooldown_until", 0) - self.wall())),
+                              cooldown_reason=item.get("cooldown_reason", ""),
+                              ip_id=next((key for key, b in self.data["bindings"].items() if b["account"] == item["id"]), ""))
+            primary = next(item for item in ips if item["primary"])
+            account = next((a for a in accounts if a["id"] == primary["account_id"]), {})
+            return {"mode": self.data["mode"], "version": VERSION, "state": primary["state"] if self.data["mode"] == "on" else "releasing" if self.data["bindings"] else "idle",
+                    "reason": primary["reason"] or "等待分配", "configured": bool(accounts),
+                    "username": account.get("username", ""), "service": account.get("service", ""),
+                    "pending_release": any(b.get("release") or self.data["mode"] == "off" for b in self.data["bindings"].values()),
+                    "changed_at": self.wall(), "heartbeat": self.heartbeat, "pid": os.getpid(), "ips": ips, "accounts": accounts}
+
+    def command(self, request):
+        action = request.get("command")
+        with self.lock:
+            if action in ("on", "off"):
+                if "account" in request:
+                    raise ValueError("请使用 config 配置账号池")
+                if action == "on" and not any(a["enabled"] for a in self.data["accounts"]):
+                    return {"needs_account": True}
+                self.data["mode"] = action
+            elif action == "pool-add":
+                kind = request.get("kind")
+                if kind not in ("ips", "accounts"):
+                    raise ValueError("kind 必须为 ips 或 accounts")
+                if len(self.data[kind]) >= (16 if kind == "ips" else 64):
+                    raise ValueError("池已达到条目上限")
+                value = valid_ip(request.get("value")) if kind == "ips" else valid_account(request.get("value"))
+                if kind == "ips" and not value["address"]:
+                    raise ValueError("副 IP 必须填写明确的源 IPv4 地址")
+                for item in self.data[kind]:
+                    keys = ("namespace", "address") if kind == "ips" else ("username",)
+                    if all(item[key] == value[key] for key in keys):
+                        raise ValueError("该账号或出口已存在")
+                value.update(id=uuid.uuid4().hex, enabled=True)
+                if kind == "accounts":
+                    value["cooldown_until"] = 0
+                self.data[kind].append(value)
+                if kind == "accounts" and not self.data["primary_account"]:
+                    self.data["primary_account"] = value["id"]
+            elif action in ("pool-enable", "pool-primary", "pool-edit"):
+                kind = request.get("kind")
+                if kind not in ("ips", "accounts"):
+                    raise ValueError("kind 必须为 ips 或 accounts")
+                item = self._find(kind, request.get("id"))
+                if action == "pool-enable":
+                    if type(request.get("enabled")) is not bool:
+                        raise ValueError("enabled 必须是布尔值")
+                    item["enabled"] = request["enabled"]
+                elif action == "pool-primary":
+                    self.data["primary_ip" if kind == "ips" else "primary_account"] = item["id"]
+                else:
+                    if item["enabled"] or any(key == item["id"] if kind == "ips" else b["account"] == item["id"] for key, b in self.data["bindings"].items()):
+                        raise ValueError("请先禁用条目并等待会话释放后再编辑")
+                    value = valid_ip(request.get("value")) if kind == "ips" else valid_account(request.get("value"))
+                    if kind == "ips" and not value["address"] and item["id"] != self.data["primary_ip"]:
+                        raise ValueError("仅主 IP 可以自动检测地址")
+                    keys = ("namespace", "address") if kind == "ips" else ("username",)
+                    if any(other["id"] != item["id"] and all(other[k] == value[k] for k in keys) for other in self.data[kind]):
+                        raise ValueError("该账号或出口已存在")
+                    item.update(value)  # deliberately retain the cooldown
+            elif action == "config":
+                # Compatibility for old automation; never replace an active account.
+                account = valid_account(request.get("account"))
+                if self.data["mode"] != "off" or self.data["bindings"]:
+                    raise ValueError("请先 off 并等待所有旧会话释放")
+                primary = self.data["primary_account"]
+                if primary:
+                    item = self._find("accounts", primary)
+                    if any(a["id"] != primary and a["username"] == account["username"] for a in self.data["accounts"]):
+                        raise ValueError("该账号已存在")
+                    item.update(account)
+                else:
+                    self.data["accounts"].append(dict(account, id="primary", enabled=True, cooldown_until=0))
+                    self.data["primary_account"] = "primary"
+            elif action != "status":
+                raise ValueError("不支持的控制命令")
+            if action != "status":
+                self._save()
+                # Stop immediately, including workers currently in probe/login.
+                self._stop_ineligible()
+                self.wake.set()
+            return self.snapshot()
+
+    def _stop_ineligible(self):
+        changed = False
+        for slot_id, binding in self.data["bindings"].items():
+            if (self.data["mode"] == "off" or not self._find("ips", slot_id)["enabled"]
+                    or not self._find("accounts", binding["account"])["enabled"] or binding.get("release")):
+                if not binding.get("release"):
+                    binding["release"] = True
+                    changed = True
+                self._engine(slot_id).command({"command": "off"})
+        if changed:
+            self._save()
+
+    def _assign(self, item, account):
+        slot_id = item["id"]
+        self.data["bindings"][slot_id] = {"account": account["id"], "online": False, "release": False}
+        self._save()  # reservation before any engine can submit authentication
+        self._engine(slot_id).command({"command": "on"})
+
+    def _run(self, slot_id):
+        try:
+            self.engines[slot_id].step()
+            with self.lock:
+                self.worker_errors.pop(slot_id, None)
+                binding = self.data["bindings"].get(slot_id)
+                engine = self.engines[slot_id]
+                if binding and binding.get("handoff") and engine.state["mode"] == "off" and not engine.state.get("uncertain"):
+                    # A new login on the main IP evicts this known local session even
+                    # when the portal's logout is delayed. No stale retry may follow it.
+                    with engine.lock:
+                        engine._save(session="", generation=engine.state["generation"] + 1)
+        except Exception:
+            logging.exception("出口处理失败：%s", slot_id)
+            with self.lock:
+                self.worker_errors[slot_id] = True
+        finally:
+            self.engines[slot_id].heartbeat = time.time()
+            self.wake.set()
+
+    def step(self, wait=False):
+        launched = []
+        with self.lock:
+            candidates = [dict(i) for i in self.data["ips"] if i["enabled"]]
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            ready = dict(zip((i["id"] for i in candidates), executor.map(self.network, candidates)))
+        with self.lock:
+            self.readiness = ready
+            self._stop_ineligible()
+            for slot_id, binding in list(self.data["bindings"].items()):
+                worker = self.workers.get(slot_id)
+                if worker and worker.is_alive():
+                    continue
+                engine = self._engine(slot_id)
+                if binding.get("release") and not engine.state["session"] and not engine.state.get("uncertain"):
+                    del self.data["bindings"][slot_id]
+                    self.engines.pop(slot_id, None)
+                    self.worker_errors.pop(slot_id, None)
+                    self._save()
+                    continue
+                engine.command({"command": "off" if binding.get("release") else "on"})
+            if self.data["mode"] == "on":
+                primary_id = self.data["primary_ip"]
+                items = sorted(self.data["ips"], key=lambda i: i["id"] != primary_id)
+                for item in items:
+                    if not item["enabled"] or item["id"] in self.data["bindings"]:
+                        continue
+                    # Don't move a healthy account to an unconfigured or disconnected main IP.
+                    if not ready.get(item["id"], {}).get("ready"):
+                        continue
+                    source = ready[item["id"]].get("source_address")
+                    if source and any(ready.get(key, {}).get("source_address") == source
+                                      and self._find("ips", key)["namespace"] == item["namespace"] for key in self.data["bindings"]):
+                        continue
+                    used = {b["account"] for b in self.data["bindings"].values()}
+                    available = [a for a in self.data["accounts"] if a["enabled"] and a["id"] not in used
+                                 and a.get("cooldown_until", 0) <= self.wall()]
+                    if available:
+                        available.sort(key=lambda a: (a["id"] != self.data["primary_account"]) if item["id"] == primary_id else (a["id"] == self.data["primary_account"]))
+                        self._assign(item, available[0])
+                    elif item["id"] == primary_id:
+                        for other, binding in self.data["bindings"].items():
+                            account = self._find("accounts", binding["account"])
+                            engine = self._engine(other)
+                            if (other != primary_id and not binding.get("release") and binding.get("online")
+                                    and engine.state["session"] and not engine.state.get("uncertain")
+                                    and account["enabled"] and account.get("cooldown_until", 0) <= self.wall()):
+                                binding["release"] = True
+                                binding["handoff"] = primary_id
+                                self._engine(other).command({"command": "off"})
+                                self._save()
+                                break
+                        # Reserve the next freed account for the primary; don't feed secondary IPs.
+                        break
+            for slot_id in list(self.data["bindings"]):
+                worker = self.workers.get(slot_id)
+                if worker and worker.is_alive():
+                    continue
+                worker = threading.Thread(target=self._run, args=(slot_id,), daemon=True)
+                self.workers[slot_id] = worker
+                launched.append(worker)
+                worker.start()
+        if wait:
+            for worker in launched:
+                worker.join(30)
+
+
 def notify(message):
     address = os.environ.get("NOTIFY_SOCKET")
     if address:
@@ -432,9 +909,9 @@ def notify(message):
             pass
 
 
-def read_message(stream):
-    line = stream.readline(8193)
-    if not line.endswith(b"\n") or len(line) > 8192:
+def read_message(stream, limit=8192):
+    line = stream.readline(limit + 1)
+    if not line.endswith(b"\n") or len(line) > limit:
         raise ValueError("控制消息过长或不完整")
     value = json.loads(line)
     if not isinstance(value, dict):
@@ -456,7 +933,7 @@ def daemon():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     migrate_legacy(CONFIG_DIR / "account.json", STATE_DIR)
     config = load_config(CONFIG_DIR / "config.json")
-    control = Controller(config, STATE_DIR, CONFIG_DIR / "account.json")
+    control = PoolController(config, STATE_DIR, CONFIG_DIR / "account.json")
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
@@ -511,7 +988,7 @@ def client(request):
         sock.connect(str(RUNTIME_DIR / "control.sock"))
         sock.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode())
         with sock.makefile("rb") as stream:
-            result = read_message(stream)
+            result = read_message(stream, 262144)
     if "error" in result:
         raise ValueError(result["error"])
     return result
@@ -538,32 +1015,115 @@ def print_status(value):
     if value.get("last_online"):
         print("最近在线：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["last_online"])))
     print("状态更新：" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value["changed_at"])))
+    for item in value.get("ips", []):
+        print("%sIP %s [%s]：%s%s" % ("主 " if item["primary"] else "", item["address"] or "自动检测",
+              "启用" if item["enabled"] else "禁用", item["state"], " → " + item["account_id"] if item["account_id"] else ""))
+    for item in value.get("accounts", []):
+        print("%s账号 %s [%s]%s" % ("主 " if item["primary"] else "", item["username"],
+              "启用" if item["enabled"] else "禁用", " 冷却 %d 秒：%s" % (item["cooldown_in"], item["cooldown_reason"]) if item["cooldown_in"] else ""))
 
 
-def configure():
-    current = client({"command": "status"})
-    if not sys.stdin.isatty():
-        raise ValueError("请在交互终端执行 campus-network config 配置账号")
-    if current.get("username"):
-        print("当前账号：%s @ %s" % (current["username"], current["service"]))
+def prompt_account():
     username = input("校园网账号：").strip()
     password = getpass.getpass("校园网密码：")
     choice = input("运营商 [1 移动 / 2 电信 / 3 联通 / 4 校园网]：").strip()
     service = SERVICES[int(choice) - 1] if choice in ("1", "2", "3", "4") else choice
-    account = valid_account({"username": username, "password": password, "service": service})
-    status = client({"command": "off"})
-    deadline = time.monotonic() + 15
-    while status.get("pending_release"):
-        if status.get("state") == "release-unconfirmed" or time.monotonic() >= deadline:
-            raise ValueError("旧会话注销尚未确认，原账号保持不变，自动认证已停用；请稍后再次执行 config")
-        time.sleep(.2)
+    return valid_account({"username": username, "password": password, "service": service})
+
+
+def prompt_ip():
+    return valid_ip({"address": input("源 IPv4（主 IP 可留空自动检测）：").strip(),
+                     "interface": input("接口名（可留空）：").strip(),
+                     "namespace": input("已有网络命名空间（可留空）：").strip()})
+
+
+def select_menu(title, rows, selected=0):
+    import curses
+    def screen(window):
+        nonlocal selected
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        window.keypad(True)
+        while True:
+            height, width = window.getmaxyx()
+            window.erase()
+            selected = max(0, min(selected, len(rows) - 1))
+            start = max(0, selected - max(1, height - 5) + 1)
+            lines = [(0, title), (1, "↑↓选择  ←禁用  →启用  Enter详情  Esc返回")]
+            lines += [(n + 3, row) for n, row in enumerate(rows[start:start + max(1, height - 4)])]
+            for line, text in lines:
+                try:
+                    active = line >= 3 and line - 3 + start == selected
+                    window.addnstr(line, 0, text, max(1, width - 1), curses.A_REVERSE if active else 0)
+                except curses.error:
+                    pass
+            window.refresh()
+            key = window.getch()
+            if key == curses.KEY_UP:
+                selected = (selected - 1) % len(rows)
+            elif key == curses.KEY_DOWN:
+                selected = (selected + 1) % len(rows)
+            elif key in (27, ord("q")):
+                return selected, "back"
+            elif key in (10, 13, curses.KEY_ENTER, curses.KEY_LEFT, curses.KEY_RIGHT):
+                return selected, "disable" if key == curses.KEY_LEFT else "enable" if key == curses.KEY_RIGHT else "enter"
+    return curses.wrapper(screen)
+
+
+def configure():
+    if not sys.stdin.isatty():
+        raise ValueError("请在交互终端执行 campus-network config；自动化配置可使用 pool 从标准输入读取 JSON")
+    page, selected = "home", 0
+    while True:
         status = client({"command": "status"})
-    return client({"command": "config", "account": account})
+        if page == "home":
+            rows = ["IP 池", "账号池", "在线模式 [%s]" % status["mode"], "返回"]
+        else:
+            rows = []
+            for item in status[page]:
+                label = item["address"] or "自动检测" if page == "ips" else item["username"] + " @ " + item["service"]
+                extra = item["state"] if page == "ips" else "冷却 %ds" % item["cooldown_in"] if item["cooldown_in"] else "可用"
+                rows.append("[%s]%s %s — %s" % ("启用" if item["enabled"] else "禁用", " 主" if item["primary"] else "", label, extra))
+            rows.append("＋ 新建 IP" if page == "ips" else "＋ 新建账号")
+        selected, key = select_menu("campus-network " + VERSION, rows, selected)
+        if key == "back" or (page == "home" and selected == 3 and key == "enter"):
+            if page == "home":
+                return status
+            page, selected = "home", 0
+            continue
+        if page == "home":
+            if selected < 2 and key == "enter":
+                page, selected = ("ips" if selected == 0 else "accounts"), 0
+            elif selected == 2:
+                result = client({"command": "on" if key == "enable" else "off" if key == "disable" else "off" if status["mode"] == "on" else "on"})
+                if result.get("needs_account"):
+                    input("请先在账号池添加或启用账号。按 Enter 返回…")
+            continue
+        try:
+            if selected == len(status[page]):
+                if key == "enter":
+                    client({"command": "pool-add", "kind": page, "value": prompt_ip() if page == "ips" else prompt_account()})
+            else:
+                item = status[page][selected]
+                request = {"kind": page, "id": item["id"]}
+                if key in ("enable", "disable"):
+                    client(dict(request, command="pool-enable", enabled=key == "enable"))
+                else:
+                    detail, operation = select_menu("条目详情：%s；编辑前请先禁用并等待释放" % rows[selected], ["设为主 IP" if page == "ips" else "设为主账号", "编辑", "返回"])
+                    if operation == "enter" and detail == 0:
+                        client(dict(request, command="pool-primary"))
+                    elif operation == "enter" and detail == 1:
+                        client(dict(request, command="pool-edit", value=prompt_ip() if page == "ips" else prompt_account()))
+        except ValueError as exc:
+            print("配置未保存：%s" % exc)
+            input("按 Enter 返回菜单…")
 
 
 def main():
     parser = argparse.ArgumentParser(description="校园网管理；on/off/status/config 均无需 sudo")
-    parser.add_argument("command", nargs="?", choices=("on", "off", "status", "config"), default="status")
+    parser.add_argument("command", nargs="?", choices=("on", "off", "status", "config", "pool"), default="status")
     parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--json", action="store_true", help="输出 JSON 状态")
     parser.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
@@ -575,7 +1135,13 @@ def main():
             return 0
         if args.command == "config" and args.json:
             raise ValueError("config 需要交互输入，不支持 --json")
-        result = configure() if args.command == "config" else client({"command": args.command})
+        if args.command == "pool":
+            request = read_message(sys.stdin.buffer)
+            if request.get("command") not in ("pool-add", "pool-enable", "pool-primary", "pool-edit"):
+                raise ValueError("pool 仅接受账号池、IP 池变更命令")
+            result = client(request)
+        else:
+            result = configure() if args.command == "config" else client({"command": args.command})
         if result.get("needs_account"):
             raise ValueError("尚未配置账号，请先执行 campus-network config")
         if args.json:

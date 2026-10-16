@@ -3,7 +3,7 @@ set -eu
 cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 [ "$(id -u)" -eq 0 ] || { echo '请使用 sudo sh ./install.sh（或切换到 root）。' >&2; exit 1; }
 [ "$(uname -s)" = Linux ] || { echo '仅支持使用 systemd 的 Linux。' >&2; exit 1; }
-for tool in python3 curl systemctl install; do
+for tool in python3 curl systemctl install ip; do
     command -v "$tool" >/dev/null 2>&1 || { echo "缺少 $tool；Debian 可使用对应版本的完整离线包。" >&2; exit 1; }
 done
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || { echo '需要 Python 3.9 或更新版本。' >&2; exit 1; }

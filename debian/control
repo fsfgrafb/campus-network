@@ -1,9 +1,9 @@
 Package: campus-network
-Version: 2.2.1
+Version: 3.0.0
 Section: net
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.9), curl, systemd, ca-certificates
+Depends: python3 (>= 3.9), curl, systemd, ca-certificates, iproute2
 Maintainer: campus-network contributors
 Homepage: https://github.com/fsfgrafb/campus-network
 Description: Persistent Ruijie ePortal campus network connection manager

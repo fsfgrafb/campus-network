@@ -146,7 +146,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD/dist:/artifacts:ro" debian:${{ matrix.version }}-slim sh -ec '
             apt-get update
-            apt-get install -y --no-install-recommends python3 curl systemd ca-certificates
+            apt-get install -y --no-install-recommends python3 curl systemd ca-certificates iproute2
             dpkg -i /artifacts/*.deb
             campus-network --version
             test -s /etc/ssl/certs/ca-certificates.crt
@@ -168,7 +168,7 @@ jobs:
       - name: Check RPM install
         run: |
           docker run --rm -v "$PWD/dist:/artifacts:ro" fedora:43 sh -ec '
-            dnf install -y python3 curl-minimal systemd ca-certificates
+            dnf install -y python3 curl-minimal systemd ca-certificates iproute
             rpm -ivh /artifacts/*.rpm
             campus-network --version
             python3 -c "import ssl; assert ssl.create_default_context().get_ca_certs()"

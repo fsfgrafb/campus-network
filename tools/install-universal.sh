@@ -20,7 +20,7 @@ if [ "$ID" = debian ] && command -v dpkg >/dev/null 2>&1; then
     fi
 fi
 # Other distributions use their installed dependencies and native package manager.
-for tool in curl systemctl; do
+for tool in curl systemctl ip; do
     command -v "$tool" >/dev/null 2>&1 || { echo "当前系统不含离线依赖，请先安装 $tool。" >&2; exit 1; }
 done
 if command -v dpkg >/dev/null 2>&1; then

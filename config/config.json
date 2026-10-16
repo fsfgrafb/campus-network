@@ -11,5 +11,7 @@
   "request_timeout": 5,
   "retry_base": 2,
   "retry_max": 120,
-  "initial_jitter": 3
+  "initial_jitter": 3,
+  "cooldown": 43200,
+  "displacement_confirm": 5
 }
